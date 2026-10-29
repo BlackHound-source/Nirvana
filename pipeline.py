@@ -43,31 +43,68 @@ def log(msg):
 # ------------------------- DATA DISCOVERY -------------------------
 
 def extract_zips(data_dir):
+    """Safely extract ZIP archives found under data_dir, including nested folders."""
     root = os.path.realpath(data_dir)
-    for zip_path in glob.glob(os.path.join(data_dir, "**", "*.zip"), recursive=True):
+    os.makedirs(root, exist_ok=True)
+    archives = sorted(glob.glob(os.path.join(root, "**", "*.zip"), recursive=True))
+
+    for zip_path in archives:
+        # Avoid repeatedly extracting an archive into itself or processing the same file.
         with zipfile.ZipFile(zip_path) as archive:
             for member in archive.infolist():
                 target = os.path.realpath(os.path.join(root, member.filename))
-                if not target.startswith(root + os.sep):
-                    raise ValueError(f"Unsafe ZIP member: {member.filename}")
+                if target != root and not target.startswith(root + os.sep):
+                    raise ValueError(f"Unsafe ZIP member in {zip_path}: {member.filename}")
             archive.extractall(root)
-            log(f"Extracted {zip_path}")
+        log(f"[DATASET] Extracted archive: {zip_path}")
 
 
 def locate_dataset(subset, data_dir):
+    """Find required C-MAPSS files regardless of nested ZIP folder structure."""
+    data_dir = os.path.abspath(os.path.expanduser(str(data_dir)))
+    log(f"[DATASET] Requested subset: {subset}")
+    log(f"[DATASET] Data directory: {data_dir}")
+
+    if not os.path.isdir(data_dir):
+        raise FileNotFoundError(
+            f"Dataset directory does not exist: {data_dir}. "
+            "Set AERO_DATA_DIR to the directory containing the C-MAPSS files."
+        )
+
     extract_zips(data_dir)
     wanted = {
         "train": f"train_{subset}.txt",
         "test": f"test_{subset}.txt",
         "rul": f"RUL_{subset}.txt",
     }
+
+    found_files = {}
+    for root, _, filenames in os.walk(data_dir):
+        for filename in filenames:
+            found_files.setdefault(filename, []).append(os.path.join(root, filename))
+
+    log(f"[DATASET] Files discovered: {sorted(found_files)[:100]}")
     paths = {}
-    for key, name in wanted.items():
-        hits = sorted(glob.glob(os.path.join(data_dir, "**", name), recursive=True))
+    missing = []
+    for key, filename in wanted.items():
+        hits = sorted(found_files.get(filename, []))
         if not hits:
-            raise FileNotFoundError(
-                f"Missing {name} under {data_dir}. Place the NASA C-MAPSS files there.")
-        paths[key] = hits[0]
+            missing.append(filename)
+        else:
+            # Prefer a direct child of data_dir, then a deterministic nested path.
+            paths[key] = min(
+                hits,
+                key=lambda candidate: (os.path.dirname(candidate) != data_dir, candidate),
+            )
+
+    if missing:
+        raise FileNotFoundError(
+            f"Missing required C-MAPSS file(s): {', '.join(missing)}. "
+            f"Searched recursively under {data_dir}. "
+            f"Discovered files: {sorted(found_files)[:100]}"
+        )
+
+    log(f"[DATASET] Resolved paths: {paths}")
     return paths
 
 
@@ -398,7 +435,10 @@ def make_model_version(subset, seed, train_hash, best):
 
 # ------------------------- MAIN PIPELINE --------------------------
 
-def run_pipeline(subset="FD001", data_dir="data", out_dir="runs", seed=SEED):
+def run_pipeline(subset="FD001", data_dir=None, out_dir=None, seed=SEED):
+    # Honour container/runtime configuration even when callers omit explicit paths.
+    data_dir = data_dir or os.environ.get("AERO_DATA_DIR", "data")
+    out_dir = out_dir or os.environ.get("AERO_OUT_DIR", "runs")
     if subset not in SUBSETS:
         raise ValueError(f"Unsupported subset: {subset}")
     run_dir = os.path.join(out_dir, subset)
@@ -610,8 +650,8 @@ def run_selftest():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="AERO-SYNAPSE C-MAPSS pipeline")
     parser.add_argument("--subset", default="FD001", choices=SUBSETS)
-    parser.add_argument("--data-dir", default="data")
-    parser.add_argument("--out-dir", default="runs")
+    parser.add_argument("--data-dir", default=os.environ.get("AERO_DATA_DIR", "data"))
+    parser.add_argument("--out-dir", default=os.environ.get("AERO_OUT_DIR", "runs"))
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--selftest", action="store_true")
     args = parser.parse_args()
