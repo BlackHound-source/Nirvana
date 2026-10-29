@@ -457,50 +457,120 @@ def run_pipeline(subset="FD001", data_dir=None, out_dir=None, seed=SEED):
         raise ValueError(f"RUL rows ({len(test_rul)}) != test engines ({len(test_ids)})")
     log(f"Training engines: {len(train_engines)} | test engines: {len(test_ids)}")
 
-    log("[2] Engine-level validation split")
-    fit_ids, val_ids = split_engine_ids(train_engines.keys(), seed=seed)
-    fit_engines = {i: train_engines[i] for i in fit_ids}
-    val_engines = {i: train_engines[i] for i in val_ids}
+    checkpoint_path = os.path.join(run_dir, "training_checkpoint.pkl")
 
-    log("[3] Validation tuning")
-    pre_val = Preprocessor().fit(fit_engines)
+    def atomic_pickle_save(payload, path):
+        """Write checkpoint atomically so an interrupted write cannot corrupt it."""
+        temp_path = path + ".tmp"
+        with open(temp_path, "wb") as handle:
+            pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
 
-    def make_items(engines, pp):
-        return [(pp.transform(engines[i]), rul_targets(len(engines[i])))
-                for i in sorted(engines)]
+    checkpoint = None
+    if os.path.isfile(checkpoint_path):
+        try:
+            with open(checkpoint_path, "rb") as handle:
+                candidate = pickle.load(handle)
+            expected = {
+                "pipeline_version": __version__,
+                "subset": subset,
+                "seed": seed,
+                "train_sha256": train_hash,
+                "test_sha256": test_hash,
+            }
+            if all(candidate.get(k) == v for k, v in expected.items()):
+                checkpoint = candidate
+                log(f"[RESUME] Compatible training checkpoint found: {checkpoint_path}")
+            else:
+                log("[RESUME] Checkpoint does not match this dataset/configuration; retraining.")
+        except Exception as exc:
+            log(f"[RESUME] Checkpoint could not be read ({exc}); retraining.")
 
-    fit_items = make_items(fit_engines, pre_val)
-    val_items = make_items(val_engines, pre_val)
+    if checkpoint is not None:
+        best = checkpoint["best"]
+        pre_dict = checkpoint["preprocessor"]
+        pre = Preprocessor(
+            keep=np.asarray(pre_dict["keep"], dtype=int),
+            low=np.asarray(pre_dict["low"], dtype=float),
+            high=np.asarray(pre_dict["high"], dtype=float),
+        )
+        cfg = checkpoint["reservoir_config"]
+        reservoir = CSNFReservoir(
+            input_dim=cfg["input_dim"],
+            alpha_inject=cfg["alpha_inject"],
+            packet_width=cfg["packet_width"],
+        )
+        model = plain_to_model(checkpoint["reservoir_model"])
+        baseline = plain_to_model(checkpoint["baseline_model"])
+        log("[RESUME] Skipped validation tuning and final training; continuing at test evaluation.")
+    else:
+        log("[2] Engine-level validation split")
+        fit_ids, val_ids = split_engine_ids(train_engines.keys(), seed=seed)
+        fit_engines = {i: train_engines[i] for i in fit_ids}
+        val_engines = {i: train_engines[i] for i in val_ids}
 
-    best = None
-    for alpha in GRID_SEARCH_ALPHA:
-        for width in GRID_SEARCH_WIDTH:
-            res = CSNFReservoir(input_dim=pre_val.n_features,
-                                alpha_inject=alpha, packet_width=width)
-            X_fit = np.vstack([res.run_engine(X)[WASHOUT:] for X, _ in fit_items])
-            y_fit = np.concatenate([y[WASHOUT:] for _, y in fit_items])
-            X_val = np.vstack([res.run_engine(X)[WASHOUT:] for X, _ in val_items])
-            y_val = np.concatenate([y[WASHOUT:] for _, y in val_items])
-            for lam in GRID_SEARCH_LAMBDA:
-                model = fit_ridge(X_fit, y_fit, lam)
-                pred = np.clip(predict_ridge(model, X_val), 0, R_MAX)
-                score = rmse(y_val, pred)
-                log(f"  alpha={alpha} width={width} lambda={lam}: val RMSE={score:.3f}")
-                if best is None or score < best["score"]:
-                    best = {"score": score, "alpha": alpha, "width": width, "lambda": lam}
-    log(f"Best reservoir settings: {best}")
+        log("[3] Validation tuning")
+        pre_val = Preprocessor().fit(fit_engines)
 
-    log("[4] Final training on all training engines")
-    pre = Preprocessor().fit(train_engines)
-    train_items = make_items(train_engines, pre)
-    reservoir = CSNFReservoir(input_dim=pre.n_features,
-                              alpha_inject=best["alpha"], packet_width=best["width"])
-    X_train = np.vstack([reservoir.run_engine(X)[WASHOUT:] for X, _ in train_items])
-    y_train = np.concatenate([y[WASHOUT:] for _, y in train_items])
-    model = fit_ridge(X_train, y_train, best["lambda"])
+        def make_items(engines, pp):
+            return [(pp.transform(engines[i]), rul_targets(len(engines[i])))
+                    for i in sorted(engines)]
 
-    B_train = np.vstack([causal_mean_features(X)[WASHOUT:] for X, _ in train_items])
-    baseline = fit_ridge(B_train, y_train, best["lambda"])
+        fit_items = make_items(fit_engines, pre_val)
+        val_items = make_items(val_engines, pre_val)
+
+        best = None
+        for alpha in GRID_SEARCH_ALPHA:
+            for width in GRID_SEARCH_WIDTH:
+                res = CSNFReservoir(input_dim=pre_val.n_features,
+                                    alpha_inject=alpha, packet_width=width)
+                X_fit = np.vstack([res.run_engine(X)[WASHOUT:] for X, _ in fit_items])
+                y_fit = np.concatenate([y[WASHOUT:] for _, y in fit_items])
+                X_val = np.vstack([res.run_engine(X)[WASHOUT:] for X, _ in val_items])
+                y_val = np.concatenate([y[WASHOUT:] for _, y in val_items])
+                for lam in GRID_SEARCH_LAMBDA:
+                    candidate_model = fit_ridge(X_fit, y_fit, lam)
+                    pred = np.clip(predict_ridge(candidate_model, X_val), 0, R_MAX)
+                    score = rmse(y_val, pred)
+                    log(f"  alpha={alpha} width={width} lambda={lam}: val RMSE={score:.3f}")
+                    if best is None or score < best["score"]:
+                        best = {"score": score, "alpha": alpha, "width": width, "lambda": lam}
+        log(f"Best reservoir settings: {best}")
+
+        log("[4] Final training on all training engines")
+        pre = Preprocessor().fit(train_engines)
+        train_items = make_items(train_engines, pre)
+        reservoir = CSNFReservoir(input_dim=pre.n_features,
+                                  alpha_inject=best["alpha"], packet_width=best["width"])
+        X_train = np.vstack([reservoir.run_engine(X)[WASHOUT:] for X, _ in train_items])
+        y_train = np.concatenate([y[WASHOUT:] for _, y in train_items])
+        model = fit_ridge(X_train, y_train, best["lambda"])
+
+        B_train = np.vstack([causal_mean_features(X)[WASHOUT:] for X, _ in train_items])
+        baseline = fit_ridge(B_train, y_train, best["lambda"])
+
+        # Save the expensive training result before the test-evaluation stage.
+        # The checkpoint is reusable only for the same dataset hashes and settings.
+        checkpoint_payload = {
+            "pipeline_version": __version__,
+            "subset": subset,
+            "seed": seed,
+            "train_sha256": train_hash,
+            "test_sha256": test_hash,
+            "best": best,
+            "preprocessor": pre.to_dict(),
+            "reservoir_config": {
+                "alpha_inject": best["alpha"],
+                "packet_width": best["width"],
+                "input_dim": pre.n_features,
+            },
+            "reservoir_model": model_to_plain(model),
+            "baseline_model": model_to_plain(baseline),
+        }
+        atomic_pickle_save(checkpoint_payload, checkpoint_path)
+        log(f"[CHECKPOINT] Training checkpoint saved: {checkpoint_path}")
 
     log("[5] Test evaluation (same protocol for both models: last cycle of each test engine)")
     truth_capped = np.minimum(test_rul, R_MAX)
