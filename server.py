@@ -168,18 +168,35 @@ def health():
 
 @app.get("/api/status")
 def status():
-    """Report job state, available subsets, and data-directory status."""
+    """Report job state, recursively discovered data files, and output status."""
     current = status_snapshot()
-
     current["available"] = available_subsets()
+    current["data_dir"] = DATA_DIR
     current["data_dir_ready"] = os.path.isdir(DATA_DIR)
 
+    discovered = set()
+    if os.path.isdir(DATA_DIR):
+        for root, _, files in os.walk(DATA_DIR):
+            discovered.update(files)
+
     current["required_files"] = {
-        subset: os.path.isfile(
-            os.path.join(DATA_DIR, f"train_{subset}.txt")
-        )
+        subset: {
+            "train": f"train_{subset}.txt" in discovered,
+            "test": f"test_{subset}.txt" in discovered,
+            "rul": f"RUL_{subset}.txt" in discovered,
+        }
         for subset in pipeline.SUBSETS
     }
+    current["dataset_files_found"] = sorted(
+        filename for filename in discovered
+        if filename.startswith(("train_FD", "test_FD", "RUL_FD"))
+    )
+    current["zip_archives"] = sorted(
+        os.path.join(root, filename)
+        for root, _, files in os.walk(DATA_DIR)
+        for filename in files
+        if filename.lower().endswith(".zip")
+    ) if os.path.isdir(DATA_DIR) else []
 
     return jsonify(current)
 
@@ -190,13 +207,30 @@ def status():
 
 @app.post("/api/run")
 def start_run():
-    """Start a background pipeline run for a requested subset."""
-    payload = request.get_json(silent=True) or {}
+    """Validate the requested dataset, then start a background pipeline run."""
+    payload = request.get_json(silent=True)
 
+    if payload is None:
+        payload = {}
     if not isinstance(payload, dict):
         abort(400, description="Request body must be a JSON object")
 
     subset = clean_subset(payload.get("subset"))
+
+    # Use the pipeline's own recursive discovery and ZIP extraction logic.
+    # This prevents the server from rejecting valid files in nested folders.
+    try:
+        dataset_paths = pipeline.locate_dataset(subset, DATA_DIR)
+    except Exception as exc:
+        app.logger.exception(
+            "Dataset preflight failed for subset %s in %s", subset, DATA_DIR
+        )
+        return jsonify(
+            error=f"Dataset unavailable for {subset}: {exc}",
+            subset=subset,
+            data_dir=DATA_DIR,
+            data_dir_exists=os.path.isdir(DATA_DIR),
+        ), 400
 
     with _lock:
         if _status["state"] == "running":
@@ -204,19 +238,6 @@ def start_run():
                 error="A run is already in progress",
                 status=dict(_status),
             ), 409
-
-        # Reject missing training data before starting a worker.
-        train_path = os.path.join(
-            DATA_DIR,
-            f"train_{subset}.txt",
-        )
-
-        if not os.path.isfile(train_path):
-            return jsonify(
-                error=f"Missing train_{subset}.txt under {DATA_DIR}",
-                data_dir=DATA_DIR,
-                expected_file=train_path,
-            ), 400
 
         _status.update(
             state="running",
@@ -226,6 +247,11 @@ def start_run():
             error=None,
             message=f"running {subset}",
         )
+
+    app.logger.info(
+        "Starting %s pipeline. Data directory=%s; resolved files=%s",
+        subset, DATA_DIR, dataset_paths,
+    )
 
     worker = threading.Thread(
         target=_worker,
@@ -496,6 +522,11 @@ def summary():
 
 if __name__ == "__main__":
     os.makedirs(OUT_DIR, exist_ok=True)
+    app.logger.info("AERO-SYNAPSE starting")
+    app.logger.info("BASE=%s", BASE)
+    app.logger.info("DATA_DIR=%s (exists=%s)", DATA_DIR, os.path.isdir(DATA_DIR))
+    app.logger.info("OUT_DIR=%s", OUT_DIR)
+    app.logger.info("PORT=%s", PORT)
 
     # Render requires the service to bind to 0.0.0.0.
     app.run(
