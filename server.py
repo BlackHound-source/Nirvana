@@ -160,7 +160,28 @@ def metrics():
         abort(404, description=f"No metrics for {subset} yet.")
     return jsonify(data)
 
-
+@app.get("/api/summary")
+def summary():
+    out = []
+    for s in pipeline.SUBSETS:
+        metrics = load_json(s, "metrics.json")
+        if metrics is None:
+            out.append({"subset": s, "available": False})
+            continue
+        out.append({
+            "subset": s,
+            "available": True,
+            "model_version": metrics.get("model_version"),
+            "generated_at": metrics.get("generated_at"),
+            "test_engines": metrics.get("test_engines"),
+            "reservoir_rmse": metrics["reservoir"]["rmse_capped"],
+            "reservoir_mae": metrics["reservoir"]["mae_capped"],
+            "baseline_rmse": metrics["ridge_baseline"]["rmse_capped"],
+            "baseline_mae": metrics["ridge_baseline"]["mae_capped"],
+            "work_orders_total": metrics.get("work_orders_total", 0),
+            "exceptions_total": metrics.get("exceptions_total", 0),
+        })
+    return jsonify(subsets=out)
 if __name__ == "__main__":
     os.makedirs(OUT_DIR, exist_ok=True)
     port = int(os.environ.get("PORT", "8000"))
