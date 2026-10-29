@@ -1,0 +1,491 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AERO-SYNAPSE — Turbofan Fleet Triage</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#f6f5f1; --ink:#111110; --muted:#6b6a64; --rule:#dcdad2; --card:#ffffff;
+  --accent:#1f4d3a; --crit:#b42318; --high:#b54708; --med:#1d4ed8; --low:#067647;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 Inter,system-ui,sans-serif;-webkit-font-smoothing:antialiased}
+.wrap{max-width:1200px;margin:0 auto;padding:0 28px}
+header.top{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap;padding:20px 0;border-bottom:1px solid var(--rule)}
+.brand{font-family:"Source Serif 4",Georgia,serif;font-size:20px;font-weight:600;letter-spacing:.02em}
+.brand small{display:block;font:500 11px Inter,sans-serif;color:var(--muted);letter-spacing:.08em;text-transform:uppercase;margin-top:2px}
+.controls{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+.seg{display:inline-flex;border:1px solid var(--rule);border-radius:999px;overflow:hidden;background:var(--card)}
+.seg button{border:0;background:none;padding:7px 14px;font:500 13px Inter,sans-serif;color:var(--muted);cursor:pointer}
+.seg button.on{background:var(--ink);color:#fff}
+.seg button:disabled{opacity:.35;cursor:not-allowed}
+.btn{border:1px solid var(--ink);background:var(--ink);color:#fff;padding:8px 16px;border-radius:999px;font:500 13px Inter,sans-serif;cursor:pointer}
+.btn:disabled{opacity:.5;cursor:wait}
+.status{font:12px "JetBrains Mono",monospace;color:var(--muted);max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.status.err{color:var(--crit)}
+.hero{padding:72px 0 48px;display:grid;grid-template-columns:1.4fr 1fr;gap:48px;align-items:end}
+.hero h1{font:400 54px/1.05 "Source Serif 4",Georgia,serif;margin:0;letter-spacing:-.01em}
+.hero p{color:var(--muted);font-size:17px;margin:0;max-width:440px}
+@media(max-width:860px){.hero{grid-template-columns:1fr}.hero h1{font-size:40px}}
+.kpis{display:grid;grid-template-columns:repeat(4,1fr);border-top:1px solid var(--ink);border-bottom:1px solid var(--rule)}
+.kpi{padding:22px 20px 22px 0}
+.kpi+.kpi{padding-left:20px;border-left:1px solid var(--rule)}
+.kpi .l{font:500 11px Inter,sans-serif;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)}
+.kpi .v{font:400 38px "Source Serif 4",Georgia,serif;margin-top:6px}
+.kpi .s{font:12px "JetBrains Mono",monospace;color:var(--muted);margin-top:4px}
+@media(max-width:860px){.kpis{grid-template-columns:1fr 1fr}.kpi:nth-child(3){border-left:0;padding-left:0}}
+.grid{display:grid;grid-template-columns:380px 1fr;gap:32px;padding:40px 0}
+@media(max-width:960px){.grid{grid-template-columns:1fr}}
+h2.sec{font:600 13px Inter,sans-serif;text-transform:uppercase;letter-spacing:.1em;margin:0 0 14px;display:flex;justify-content:space-between;align-items:baseline}
+h2.sec span{color:var(--muted);font:500 12px "JetBrains Mono",monospace;text-transform:none;letter-spacing:0}
+.panel{background:var(--card);border:1px solid var(--rule);border-radius:14px;padding:20px}
+.filters{display:flex;gap:6px;margin-bottom:12px;flex-wrap:wrap}
+.filters button{border:1px solid var(--rule);background:none;border-radius:999px;padding:4px 10px;font:500 12px Inter,sans-serif;color:var(--muted);cursor:pointer}
+.filters button.on{background:var(--ink);color:#fff;border-color:var(--ink)}
+.roster{max-height:560px;overflow:auto;margin:0 -8px}
+.row{display:flex;justify-content:space-between;align-items:center;padding:10px 8px;border-radius:8px;cursor:pointer;border-bottom:1px solid #efeee9}
+.row:hover{background:#f7f6f2}
+.row.sel{background:#f1efe8}
+.row .id{font:500 13px "JetBrains Mono",monospace}
+.row .meta{font:12px Inter,sans-serif;color:var(--muted)}
+.pill{font:600 10px Inter,sans-serif;text-transform:uppercase;letter-spacing:.06em;padding:3px 8px;border-radius:999px;color:#fff;display:inline-block}
+.critical{background:var(--crit)} .high{background:var(--high)} .medium{background:var(--med)} .low{background:var(--low)} .review{background:#6b6a64}
+.detail .head{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap}
+.detail h3{font:400 30px "Source Serif 4",Georgia,serif;margin:0}
+.detail .action{font:500 12px "JetBrains Mono",monospace;color:var(--accent);margin-top:6px}
+.stats{display:flex;gap:28px}
+.stats div{text-align:right}
+.stats .l{font:500 10px Inter,sans-serif;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)}
+.stats .v{font:400 26px "Source Serif 4",Georgia,serif}
+svg.chart{width:100%;height:auto;margin-top:18px;background:#fbfaf7;border-radius:10px}
+.legend{display:flex;gap:18px;font:12px Inter,sans-serif;color:var(--muted);margin-top:8px;flex-wrap:wrap}
+.legend i{display:inline-block;width:18px;height:2px;vertical-align:middle;margin-right:6px}
+.sensors{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-top:18px}
+.sensor{border:1px solid var(--rule);border-radius:10px;padding:10px 12px}
+.sensor .l{font:500 11px "JetBrains Mono",monospace;color:var(--muted)}
+.sensor .v{font:500 15px "JetBrains Mono",monospace;margin-top:4px}
+@media(max-width:700px){.sensors{grid-template-columns:1fr 1fr}}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;font:500 11px Inter,sans-serif;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);padding:8px;border-bottom:1px solid var(--rule)}
+td{padding:9px 8px;border-bottom:1px solid #efeee9;font-family:"JetBrains Mono",monospace;font-size:12px}
+.tabs{display:flex;gap:6px;margin:0 0 14px}
+.tabs button{border:1px solid var(--rule);background:none;border-radius:999px;padding:5px 12px;font:500 12px Inter,sans-serif;color:var(--muted);cursor:pointer}
+.tabs button.on{background:var(--ink);color:#fff;border-color:var(--ink)}
+.wo{margin-top:40px}
+.compare{margin-top:40px}
+.compare table td{font-size:12px}
+.delta-good{color:var(--low)} .delta-bad{color:var(--crit)}
+.method{padding:56px 0 72px;border-top:1px solid var(--ink);display:grid;grid-template-columns:1fr 2fr;gap:40px}
+.method h2{font:400 32px "Source Serif 4",Georgia,serif;margin:0}
+.method p{color:var(--muted);margin:0 0 12px;max-width:680px}
+.empty{padding:40px;text-align:center;color:var(--muted)}
+footer{border-top:1px solid var(--rule);padding:18px 0;font:12px "JetBrains Mono",monospace;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <div class="brand">AERO-SYNAPSE<small>Turbofan fleet triage</small></div>
+    <div class="controls">
+      <div class="seg" id="subsets"></div>
+      <button class="btn" id="runBtn">Run pipeline</button>
+      <span class="status" id="runStatus">loading…</span>
+    </div>
+  </header>
+
+  <section class="hero">
+    <h1>Predict remaining life.<br>Dispatch maintenance before failure.</h1>
+    <p id="heroNote">Reading the latest run from the server.</p>
+  </section>
+
+  <section class="kpis">
+    <div class="kpi"><div class="l">Engines in view</div><div class="v" id="kEngines">—</div><div class="s" id="kEnginesSub">&nbsp;</div></div>
+    <div class="kpi"><div class="l">Critical</div><div class="v" id="kCrit">—</div><div class="s">RUL ≤ 10 cycles</div></div>
+    <div class="kpi"><div class="l">Reservoir RMSE</div><div class="v" id="kRmse">—</div><div class="s" id="kRmseSub">&nbsp;</div></div>
+    <div class="kpi"><div class="l">Work orders</div><div class="v" id="kWo">—</div><div class="s" id="kWoSub">&nbsp;</div></div>
+  </section>
+
+  <div class="grid">
+    <aside>
+      <h2 class="sec">Fleet roster <span id="rosterCount"></span></h2>
+      <div class="panel">
+        <div class="filters" id="filters"></div>
+        <div class="roster" id="roster"></div>
+      </div>
+    </aside>
+
+    <main>
+      <div class="panel detail" id="detail">
+        <div class="empty">Loading…</div>
+      </div>
+
+      <div class="wo">
+        <h2 class="sec">Operations log <span id="logCount"></span></h2>
+        <div class="panel">
+          <div class="tabs" id="logTabs"></div>
+          <div style="overflow:auto;max-height:340px"><table id="logTable"></table></div>
+        </div>
+      </div>
+
+      <div class="compare">
+        <h2 class="sec">Model comparison across subsets <span id="cmpCount"></span></h2>
+        <div class="panel">
+          <div style="overflow:auto"><table id="cmpTable"></table></div>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <section class="method">
+    <h2>Method</h2>
+    <div>
+      <p>Each test engine's sensor stream is normalised with training-set bounds, passed through a deterministic complex-valued reservoir (split-step field dynamics on a 32-point grid), and mapped to RUL with ridge regression. Hyperparameters are chosen on a validation split of the training engines.</p>
+      <p>Both models are scored on the last observed cycle of each test engine against the NASA RUL targets, capped at 125. Triage bands: critical ≤ 10, high ≤ 30, medium ≤ 60 cycles. Work orders are keyed by SHA-256 of subset, engine, cycle and action, so re-running a pipeline never duplicates a dispatch.</p>
+    </div>
+  </section>
+
+  <footer id="foot">AERO-SYNAPSE · NASA C-MAPSS turbofan degradation</footer>
+</div>
+
+<script>
+const SUBSETS = ['FD001', 'FD002', 'FD003', 'FD004'];
+const SEV_ORDER = { critical: 0, high: 1, medium: 2, low: 3, review: 4 };
+const S = {
+  subset: 'FD001', available: [], summary: [], engines: [], metrics: null,
+  filter: 'ALL', selected: null, logTab: 'work', runPoll: null,
+};
+const $ = (id) => document.getElementById(id);
+const esc = (v) => String(v ?? '').replace(/[&<>"']/g, c =>
+  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const pad3 = (n) => String(n).padStart(3, '0');
+const fmt = (v, d = 1) => (typeof v === 'number' && isFinite(v)) ? v.toFixed(d) : '—';
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || `${r.status} ${r.statusText}`);
+  return j;
+}
+
+function setStatus(text, isErr = false) {
+  const el = $('runStatus');
+  el.textContent = text;
+  el.classList.toggle('err', isErr);
+  el.title = text;
+}
+
+/* ---------- subset selector ---------- */
+function renderSubsets() {
+  $('subsets').innerHTML = SUBSETS.map(s => {
+    const ok = S.available.includes(s);
+    return `<button data-s="${s}" class="${s === S.subset ? 'on' : ''}" ${ok ? '' : 'disabled'}
+              title="${ok ? '' : 'No run yet for ' + s}">${s}</button>`;
+  }).join('');
+  $('subsets').querySelectorAll('button').forEach(b => b.onclick = () => {
+    if (b.dataset.s === S.subset) return;
+    S.subset = b.dataset.s;
+    S.selected = null;
+    loadSubset();
+  });
+}
+
+/* ---------- filters + roster ---------- */
+function renderFilters() {
+  const f = ['ALL', 'critical', 'high', 'medium', 'low'];
+  $('filters').innerHTML = f.map(x =>
+    `<button data-f="${x}" class="${x === S.filter ? 'on' : ''}">${x === 'ALL' ? 'All' : x}</button>`).join('');
+  $('filters').querySelectorAll('button').forEach(b => b.onclick = () => {
+    S.filter = b.dataset.f; renderFilters(); renderRoster();
+  });
+}
+
+function sortedEngines() {
+  return [...S.engines].sort((a, b) =>
+    (SEV_ORDER[a.severity] ?? 9) - (SEV_ORDER[b.severity] ?? 9) || a.pred_rul - b.pred_rul);
+}
+
+function renderRoster() {
+  const list = sortedEngines().filter(e => S.filter === 'ALL' || e.severity === S.filter);
+  $('rosterCount').textContent = `${list.length} / ${S.engines.length}`;
+  $('roster').innerHTML = list.length ? list.map(e => `
+    <div class="row ${e.id === S.selected ? 'sel' : ''}" data-id="${e.id}">
+      <div><div class="id">Unit #${pad3(e.id)}</div>
+           <div class="meta">${e.cycles_observed} cycles observed</div></div>
+      <div style="text-align:right"><span class="pill ${esc(e.severity)}">${esc(e.severity)}</span>
+           <div class="meta" style="margin-top:4px">${fmt(e.pred_rul)} RUL</div></div>
+    </div>`).join('') : '<div class="empty">No engines match this filter.</div>';
+  $('roster').querySelectorAll('.row').forEach(r =>
+    r.onclick = () => selectEngine(+r.dataset.id));
+}
+
+/* ---------- engine detail ---------- */
+async function selectEngine(id) {
+  S.selected = id;
+  renderRoster();
+  try {
+    const e = await api(`/api/engine/${id}?subset=${S.subset}`);
+    drawDetail(e);
+  } catch (err) {
+    $('detail').innerHTML = `<div class="empty">${esc(err.message)}</div>`;
+  }
+}
+
+function drawDetail(e) {
+  const hist = e.history || [];
+  const n = hist.length;
+  const W = 760, H = 280, pad = { l: 44, r: 16, t: 16, b: 28 };
+  const iw = W - pad.l - pad.r, ih = H - pad.t - pad.b;
+  const x = t => pad.l + (t - 1) / Math.max(1, n - 1) * iw;
+  const y = v => pad.t + ih - Math.min(Math.max(v, 0), 125) / 125 * ih;
+
+  // Ground-truth RUL at each observed cycle: the test set gives RUL only at the
+  // last cycle, so the linear reference line is drawn from it backwards.
+  const truth = hist.map((_, i) =>
+    Math.min(125, Math.max(0, e.true_rul + (n - (i + 1)))));
+  const path = arr => arr.map((v, i) =>
+    `${i ? 'L' : 'M'}${x(i + 1).toFixed(1)},${y(v).toFixed(1)}`).join(' ');
+
+  const grid = [0, 25, 50, 75, 100, 125].map(v =>
+    `<line x1="${pad.l}" x2="${W - pad.r}" y1="${y(v)}" y2="${y(v)}" stroke="#e6e4dc"/>
+     <text x="${pad.l - 8}" y="${y(v) + 4}" text-anchor="end" font-size="11" fill="#6b6a64" font-family="JetBrains Mono">${v}</text>`).join('');
+  const crit = `<line x1="${pad.l}" x2="${W - pad.r}" y1="${y(10)}" y2="${y(10)}" stroke="#b42318" stroke-dasharray="4 4" opacity=".6"/>`;
+  const last = n ? `<circle cx="${x(n)}" cy="${y(hist[n - 1])}" r="5" fill="#b42318" stroke="#fff" stroke-width="2"/>` : '';
+
+  const sensors = Object.keys(e.sensors || {}).sort((a, b) => +a.slice(1) - +b.slice(1))
+    .slice(0, 10)
+    .map(k => `<div class="sensor"><div class="l">${esc(k)}</div><div class="v">${fmt(e.sensors[k], 2)}</div></div>`)
+    .join('');
+
+  $('detail').innerHTML = `
+    <div class="head">
+      <div>
+        <div style="font:500 11px Inter;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)">${esc(S.subset)} · Unit #${pad3(e.id)}</div>
+        <h3>${esc(e.severity)[0].toUpperCase() + esc(e.severity).slice(1)} priority</h3>
+        <div class="action">${esc(e.action)}</div>
+      </div>
+      <div class="stats">
+        <div><div class="l">Predicted RUL</div><div class="v">${fmt(e.pred_rul)}</div></div>
+        <div><div class="l">True RUL</div><div class="v">${fmt(e.true_rul, 0)}</div></div>
+        <div><div class="l">Cycles</div><div class="v">${e.cycles_observed}</div></div>
+      </div>
+    </div>
+    <svg class="chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">
+      ${grid}${crit}
+      <path d="${path(truth)}" fill="none" stroke="#9a988f" stroke-width="1.6" stroke-dasharray="5 4"/>
+      <path d="${path(hist)}" fill="none" stroke="#1f4d3a" stroke-width="2.4"/>
+      ${last}
+      <text x="${W - pad.r}" y="${H - 8}" text-anchor="end" font-size="11" fill="#6b6a64" font-family="JetBrains Mono">cycle ${n}</text>
+    </svg>
+    <div class="legend">
+      <span><i style="background:#1f4d3a"></i>Model prediction</span>
+      <span><i style="background:#9a988f"></i>Reference RUL (capped 125)</span>
+      <span><i style="background:#b42318"></i>Critical threshold (10)</span>
+    </div>
+    <div class="sensors">${sensors}</div>`;
+}
+
+/* ---------- operations log (work orders / exceptions) ---------- */
+function renderLogTabs() {
+  const tabs = [['work', 'Work orders'], ['exc', 'Exceptions']];
+  $('logTabs').innerHTML = tabs.map(([k, label]) =>
+    `<button data-t="${k}" class="${k === S.logTab ? 'on' : ''}">${label}</button>`).join('');
+  $('logTabs').querySelectorAll('button').forEach(b => b.onclick = () => {
+    S.logTab = b.dataset.t; renderLogTabs(); loadLog();
+  });
+}
+
+async function loadLog() {
+  try {
+    if (S.logTab === 'work') {
+      const d = await api(`/api/workorders?subset=${S.subset}&limit=100`);
+      $('logCount').textContent = `${d.orders.length} of ${d.total}`;
+      $('logTable').innerHTML = `
+        <tr><th>Unit</th><th>Cycle</th><th>RUL</th><th>Severity</th><th>Action</th><th>Key</th></tr>` +
+        d.orders.map(o => `
+          <tr><td>#${pad3(o.engine_id)}</td><td>${o.cycle}</td>
+          <td>${fmt(o.rul_prediction)}</td>
+          <td><span class="pill ${esc(o.severity)}">${esc(o.severity)}</span></td>
+          <td>${esc(o.action)}</td><td>${esc(String(o.idempotency_key).slice(0, 12))}…</td></tr>`).join('')
+        || '<tr><td colspan="6" class="empty">No work orders.</td></tr>';
+    } else {
+      const d = await api(`/api/exceptions?subset=${S.subset}`);
+      $('logCount').textContent = `${d.exceptions.length} of ${d.total}`;
+      $('logTable').innerHTML = `
+        <tr><th>Unit</th><th>Cycle</th><th>Reason</th><th>Key</th></tr>` +
+        d.exceptions.map(x => `
+          <tr><td>#${pad3(x.engine_id)}</td><td>${x.cycle}</td>
+          <td>${esc(x.reason)}</td><td>${esc(String(x.idempotency_key).slice(0, 12))}…</td></tr>`).join('')
+        || '<tr><td colspan="4" class="empty">No exceptions.</td></tr>';
+    }
+  } catch (err) {
+    $('logTable').innerHTML = `<tr><td class="empty">${esc(err.message)}</td></tr>`;
+  }
+}
+
+/* ---------- cross-subset comparison ---------- */
+function renderComparison() {
+  const rows = S.summary.filter(s => s.available);
+  $('cmpCount').textContent = `${rows.length} of ${SUBSETS.length} subsets`;
+  $('cmpTable').innerHTML = `
+    <tr><th>Subset</th><th>Engines</th><th>Reservoir RMSE</th><th>Reservoir MAE</th>
+        <th>Baseline RMSE</th><th>Baseline MAE</th><th>Δ RMSE vs baseline</th><th>Model</th></tr>` +
+    (rows.map(s => {
+      const d = s.reservoir_rmse - s.baseline_rmse;
+      const cls = d <= 0 ? 'delta-good' : 'delta-bad';
+      return `<tr>
+        <td>${esc(s.subset)}</td><td>${s.test_engines}</td>
+        <td>${fmt(s.reservoir_rmse, 2)}</td><td>${fmt(s.reservoir_mae, 2)}</td>
+        <td>${fmt(s.baseline_rmse, 2)}</td><td>${fmt(s.baseline_mae, 2)}</td>
+        <td class="${cls}">${d > 0 ? '+' : ''}${fmt(d, 2)}</td>
+        <td>${esc(String(s.model_version ?? '').slice(0, 10))}</td></tr>`;
+    }).join('') || '<tr><td class="empty">No completed runs yet.</td></tr>');
+}
+
+/* ---------- KPIs and hero ---------- */
+function renderKpis() {
+  const e = S.engines;
+  $('kEngines').textContent = e.length || '—';
+  $('kEnginesSub').textContent = e.length
+    ? `${e.filter(x => x.severity !== 'low').length} need attention` : '\u00a0';
+  $('kCrit').textContent = e.length ? e.filter(x => x.severity === 'critical').length : '—';
+
+  const m = S.metrics;
+  if (m) {
+    $('kRmse').textContent = fmt(m.reservoir.rmse_capped, 2);
+    const b = m.ridge_baseline.rmse_capped, r = m.reservoir.rmse_capped;
+    $('kRmseSub').textContent = b > 0
+      ? `${(100 * (1 - r / b)).toFixed(1)}% vs ridge baseline`
+      : '\u00a0';
+    $('kWo').textContent = m.work_orders_total ?? '—';
+    $('kWoSub').textContent = `${m.exceptions_total ?? 0} exceptions · ${m.model_version ?? ''}`;
+    $('heroNote').textContent =
+      `${S.subset}: ${m.test_engines} test engines, model ${m.model_version}, generated ${new Date(m.generated_at).toUTCString()}.`;
+    $('foot').textContent =
+      `AERO-SYNAPSE · ${S.subset} · pipeline ${m.pipeline_version} · test sha256 ${String(m.test_sha256).slice(0, 12)}…`;
+  } else {
+    ['kRmse', 'kWo'].forEach(id => $(id).textContent = '—');
+    ['kRmseSub', 'kWoSub'].forEach(id => $(id).textContent = '\u00a0');
+    $('heroNote').textContent = `No completed run for ${S.subset}. Press Run pipeline to produce one.`;
+  }
+}
+
+/* ---------- loaders ---------- */
+async function loadSummary() {
+  const d = await api('/api/summary');
+  S.summary = d.subsets;
+  S.available = d.subsets.filter(s => s.available).map(s => s.subset);
+}
+
+async function loadSubset() {
+  renderSubsets();
+  S.engines = []; S.metrics = null;
+  try {
+    const fleet = await api(`/api/fleet?subset=${S.subset}`);
+    S.engines = fleet.engines;
+    S.metrics = fleet.metrics;
+  } catch (err) {
+    setStatus(err.message, true);
+  }
+  if (S.selected === null && S.engines.length) {
+    S.selected = sortedEngines()[0].id;
+  }
+  renderKpis();
+  renderFilters();
+  renderRoster();
+  renderLogTabs();
+  renderComparison();
+  await loadLog();
+  if (S.selected !== null) await selectEngine(S.selected);
+  else $('detail').innerHTML = '<div class="empty">Run the pipeline for this subset to see engines.</div>';
+  if (!S.engines.length) setStatus(`no run for ${S.subset}`);
+}
+
+async function refresh() {
+  try {
+    await loadSummary();
+    renderSubsets();
+    renderComparison();
+  } catch (err) {
+    setStatus(`server unreachable: ${err.message}`, true);
+  }
+}
+
+/* ---------- pipeline trigger ---------- */
+function stopPolling() {
+  if (S.runPoll) { clearInterval(S.runPoll); S.runPoll = null; }
+}
+
+async function runPipeline() {
+  const btn = $('runBtn');
+  btn.disabled = true;
+  stopPolling();
+  try {
+    await api('/api/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ subset: S.subset }),
+    });
+    setStatus(`running ${S.subset}…`);
+    S.runPoll = setInterval(async () => {
+      try {
+        const st = await api('/api/status');
+        if (st.state === 'running') {
+          const secs = st.started
+            ? Math.round((Date.now() - Date.parse(st.started)) / 1000) : 0;
+          setStatus(`running ${st.subset}… ${secs}s`);
+          return;
+        }
+        stopPolling();
+        if (st.state === 'error') {
+          setStatus(`error: ${st.error}`, true);
+        } else {
+          setStatus(st.message);
+          await refresh();
+          await loadSubset();
+        }
+        btn.disabled = false;
+      } catch (err) {
+        stopPolling();
+        setStatus(`poll failed: ${err.message}`, true);
+        btn.disabled = false;
+      }
+    }, 1500);
+  } catch (err) {
+    setStatus(err.message, true);
+    btn.disabled = false;
+  }
+}
+
+/* ---------- boot ---------- */
+$('runBtn').onclick = runPipeline;
+
+(async function boot() {
+  try {
+    const st = await api('/api/status');
+    if (st.state === 'running') {
+      // A run was already in progress when the page loaded: attach to it.
+      $('runBtn').disabled = true;
+      setStatus(`running ${st.subset}…`);
+      S.subset = st.subset || S.subset;
+      S.runPoll = setInterval(() => runPipeline._resume?.(), 0);
+    }
+    await refresh();
+    S.subset = S.available[0] || S.subset;
+    await loadSubset();
+    if (!S.available.length) {
+      setStatus('no completed runs — press Run pipeline');
+    } else {
+      setStatus(`${S.available.length} subset(s) available`);
+    }
+  } catch (err) {
+    setStatus(`server unreachable: ${err.message}`, true);
+    $('detail').innerHTML = `<div class="empty">Start the server with <code>python server.py</code>.</div>`;
+  }
+})();
+</script>
+</body>
+</html>
