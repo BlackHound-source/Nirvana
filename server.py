@@ -18,6 +18,9 @@ DATA_DIR = os.environ.get("AERO_DATA_DIR", os.path.join(BASE, "data"))
 OUT_DIR = os.environ.get("AERO_OUT_DIR", os.path.join(BASE, "runs"))
 STATIC_DIR = os.path.join(BASE, "static")
 
+# Render supplies the PORT environment variable.
+PORT = int(os.environ.get("PORT", "10000"))
+
 app = Flask(__name__, static_folder=STATIC_DIR, static_url_path="")
 
 _lock = threading.Lock()
@@ -27,7 +30,7 @@ _status = {
     "started": None,
     "finished": None,
     "error": None,
-    "message": "ready"
+    "message": "ready",
 }
 
 
@@ -43,14 +46,17 @@ def load_json(subset, name):
     path = os.path.join(run_dir(subset), name)
     if not os.path.exists(path):
         return None
+
     with open(path, encoding="utf-8") as f:
         return json.load(f)
 
 
 def clean_subset(value):
     subset = (value or "FD001").upper()
+
     if subset not in pipeline.SUBSETS:
         abort(400, description=f"Unknown subset: {subset}")
+
     return subset
 
 
@@ -74,28 +80,36 @@ def index():
     return send_from_directory(STATIC_DIR, "index.html")
 
 
+@app.get("/health")
+def health():
+    return jsonify(
+        status="ok",
+        service="aero-synapse",
+        timestamp=now_iso(),
+    ), 200
+
+
 @app.get("/api/status")
 def status():
     return jsonify(
         dict(
             _status,
             available=available_subsets(),
-            data_dir_ready=os.path.isdir(DATA_DIR)
+            data_dir_ready=os.path.isdir(DATA_DIR),
         )
     )
 
 
 @app.post("/api/run")
 def start_run():
-    subset = clean_subset(
-        (request.get_json(silent=True) or {}).get("subset")
-    )
+    payload = request.get_json(silent=True) or {}
+    subset = clean_subset(payload.get("subset"))
 
     with _lock:
         if _status["state"] == "running":
             return jsonify(
                 error="A run is already in progress",
-                status=_status
+                status=dict(_status),
             ), 409
 
         _status.update(
@@ -104,35 +118,41 @@ def start_run():
             started=now_iso(),
             finished=None,
             error=None,
-            message=f"running {subset}"
+            message=f"running {subset}",
         )
 
     threading.Thread(
         target=_worker,
         args=(subset,),
-        daemon=True
+        daemon=True,
     ).start()
 
-    return jsonify(_status), 202
+    return jsonify(dict(_status)), 202
 
 
 def _worker(subset):
     try:
+        os.makedirs(OUT_DIR, exist_ok=True)
         pipeline.run_pipeline(subset, DATA_DIR, OUT_DIR)
 
-        _status.update(
-            state="idle",
-            finished=now_iso(),
-            message=f"completed {subset}"
-        )
+        with _lock:
+            _status.update(
+                state="idle",
+                finished=now_iso(),
+                error=None,
+                message=f"completed {subset}",
+            )
 
     except Exception as exc:
-        _status.update(
-            state="error",
-            finished=now_iso(),
-            error=str(exc),
-            message="run failed"
-        )
+        app.logger.exception("Pipeline failed for %s", subset)
+
+        with _lock:
+            _status.update(
+                state="error",
+                finished=now_iso(),
+                error=str(exc),
+                message="run failed",
+            )
 
 
 @app.get("/api/fleet")
@@ -143,7 +163,7 @@ def fleet():
     if data is None:
         abort(
             404,
-            description=f"No run for {subset} yet. POST /api/run first."
+            description=f"No run for {subset} yet. POST /api/run first.",
         )
 
     engines = [
@@ -154,7 +174,7 @@ def fleet():
     return jsonify(
         subset=subset,
         engines=engines,
-        metrics=load_json(subset, "metrics.json")
+        metrics=load_json(subset, "metrics.json"),
     )
 
 
@@ -164,81 +184,62 @@ def engine(engine_id):
     data = load_json(subset, "predictions.json")
 
     if data is None:
-        abort(
-            404,
-            description=f"No run for {subset} yet."
-        )
+        abort(404, description=f"No run for {subset} yet.")
 
     for e in data["engines"]:
         if e["id"] == engine_id:
             return jsonify(subset=subset, **e)
 
-    abort(
-        404,
-        description=f"Engine {engine_id} not found in {subset}"
-    )
+    abort(404, description=f"Engine {engine_id} not found in {subset}")
 
 
 @app.get("/api/workorders")
 def workorders():
     subset = clean_subset(request.args.get("subset"))
 
-    limit = min(
-        max(int(request.args.get("limit", 50)), 1),
-        500
-    )
+    try:
+        limit = int(request.args.get("limit", 50))
+    except (TypeError, ValueError):
+        abort(400, description="limit must be an integer")
 
-    path = os.path.join(
-        run_dir(subset),
-        "maintenance.sqlite"
-    )
+    limit = min(max(limit, 1), 500)
+
+    path = os.path.join(run_dir(subset), "maintenance.sqlite")
 
     if not os.path.exists(path):
-        return jsonify(
-            subset=subset,
-            total=0,
-            orders=[]
-        )
+        return jsonify(subset=subset, total=0, orders=[])
 
     con = store.connect(path)
 
     try:
-        total = store.count(
-            con,
-            "maintenance_records"
-        )
+        total = store.count(con, "maintenance_records")
 
         rows = con.execute(
-            "SELECT * FROM maintenance_records "
-            "ORDER BY rowid DESC LIMIT ?",
-            (limit,)
+            """
+            SELECT *
+            FROM maintenance_records
+            ORDER BY rowid DESC
+            LIMIT ?
+            """,
+            (limit,),
         ).fetchall()
-
     finally:
         con.close()
 
     return jsonify(
         subset=subset,
         total=total,
-        orders=[dict(r) for r in rows]
+        orders=[dict(r) for r in rows],
     )
 
 
 @app.get("/api/exceptions")
 def exceptions():
     subset = clean_subset(request.args.get("subset"))
-
-    path = os.path.join(
-        run_dir(subset),
-        "maintenance.sqlite"
-    )
+    path = os.path.join(run_dir(subset), "maintenance.sqlite")
 
     if not os.path.exists(path):
-        return jsonify(
-            subset=subset,
-            total=0,
-            exceptions=[]
-        )
+        return jsonify(subset=subset, total=0, exceptions=[])
 
     con = store.connect(path)
 
@@ -246,17 +247,20 @@ def exceptions():
         total = store.count(con, "exceptions")
 
         rows = con.execute(
-            "SELECT * FROM exceptions "
-            "ORDER BY rowid DESC LIMIT 100"
+            """
+            SELECT *
+            FROM exceptions
+            ORDER BY rowid DESC
+            LIMIT 100
+            """
         ).fetchall()
-
     finally:
         con.close()
 
     return jsonify(
         subset=subset,
         total=total,
-        exceptions=[dict(r) for r in rows]
+        exceptions=[dict(r) for r in rows],
     )
 
 
@@ -266,7 +270,7 @@ def runs():
 
     return jsonify(
         subset=subset,
-        runs=registry.list_runs(OUT_DIR, subset)
+        runs=registry.list_runs(OUT_DIR, subset),
     )
 
 
@@ -276,59 +280,55 @@ def metrics():
     data = load_json(subset, "metrics.json")
 
     if data is None:
-        abort(
-            404,
-            description=f"No metrics for {subset} yet."
-        )
+        abort(404, description=f"No metrics for {subset} yet.")
 
     return jsonify(data)
 
 
 @app.get("/api/summary")
 def summary():
-    out = []
+    output = []
 
-    for s in pipeline.SUBSETS:
-        metrics = load_json(s, "metrics.json")
+    for subset in pipeline.SUBSETS:
+        metrics_data = load_json(subset, "metrics.json")
 
-        if metrics is None:
-            out.append({
-                "subset": s,
-                "available": False
+        if metrics_data is None:
+            output.append({
+                "subset": subset,
+                "available": False,
             })
             continue
 
-        out.append({
-            "subset": s,
+        reservoir = metrics_data["reservoir"]
+        baseline = metrics_data["ridge_baseline"]
+
+        output.append({
+            "subset": subset,
             "available": True,
-            "model_version": metrics.get("model_version"),
-            "generated_at": metrics.get("generated_at"),
-            "test_engines": metrics.get("test_engines"),
-            "reservoir_rmse": metrics["reservoir"]["rmse_capped"],
-            "reservoir_mae": metrics["reservoir"]["mae_capped"],
-            "baseline_rmse": metrics["ridge_baseline"]["rmse_capped"],
-            "baseline_mae": metrics["ridge_baseline"]["mae_capped"],
-            "work_orders_total": metrics.get("work_orders_total", 0),
-            "exceptions_total": metrics.get("exceptions_total", 0),
+            "model_version": metrics_data.get("model_version"),
+            "generated_at": metrics_data.get("generated_at"),
+            "test_engines": metrics_data.get("test_engines"),
+            "reservoir_rmse": reservoir["rmse_capped"],
+            "reservoir_mae": reservoir["mae_capped"],
+            "baseline_rmse": baseline["rmse_capped"],
+            "baseline_mae": baseline["mae_capped"],
+            "work_orders_total": metrics_data.get(
+                "work_orders_total", 0
+            ),
+            "exceptions_total": metrics_data.get(
+                "exceptions_total", 0
+            ),
         })
 
-    return jsonify(subsets=out)
+    return jsonify(subsets=output)
 
-
-# ---------------------------------------------------------
-# RENDER DEPLOYMENT FIX
-# ---------------------------------------------------------
 
 if __name__ == "__main__":
     os.makedirs(OUT_DIR, exist_ok=True)
 
-    # Render provides PORT automatically.
-    port = int(os.environ.get("PORT", "10000"))
-
-    # Bind to all interfaces so Render can detect the port.
     app.run(
         host="0.0.0.0",
-        port=port,
+        port=PORT,
         threaded=True,
-        debug=False
+        debug=False,
     )
