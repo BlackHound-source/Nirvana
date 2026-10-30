@@ -23,7 +23,7 @@ import numpy as np
 
 import store
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 SUBSETS = ("FD001", "FD002", "FD003", "FD004")
 R_MAX = 125.0
@@ -33,8 +33,12 @@ SEED = 0
 N_COLS = 26
 GRID_SEARCH_ALPHA = (0.35, 0.65)
 GRID_SEARCH_WIDTH = (0.25, 0.35)
-GRID_SEARCH_LAMBDA = (1e-4,)
+GRID_SEARCH_LAMBDA = (1e-6, 1e-5, 1e-4, 1e-3, 1e-2)
 READOUT_RCOND = 1e-4
+RUL_BINS = (0, 10, 30, 60, 90, 126)
+CYCLE_BINS = (1, 30, 60, 100, 10**6)
+SMOOTH_BETA_GRID = (0.2, 0.4, 0.6)
+SMOOTH_DEADBAND_GRID = (1.0, 2.0, 4.0)
 
 
 def log(msg):
@@ -159,6 +163,13 @@ def split_engine_ids(ids, fraction=VAL_FRACTION, seed=SEED):
 
 # ------------------------- PREPROCESSING --------------------------
 
+def regime_ids(rows):
+    """Operating-condition cluster per row (settings in columns 3-5 after id/cycle)."""
+    settings = np.round(rows[:, 2:5], 1)
+    _, inv = np.unique(settings, axis=0, return_inverse=True)
+    return np.asarray(inv).ravel()
+
+
 @dataclass
 class Preprocessor:
     keep: np.ndarray | None = None
@@ -188,6 +199,58 @@ class Preprocessor:
     def to_dict(self):
         return {"keep": self.keep.tolist(), "low": self.low.tolist(),
                 "high": self.high.tolist()}
+
+
+@dataclass
+class RegimePreprocessor:
+    """One Preprocessor per operating regime. Regimes unseen in training fall back
+    to a global Preprocessor fitted on all training rows."""
+    per_regime: dict = field(default_factory=dict)
+    global_pre: Preprocessor | None = None
+
+    def fit(self, engines):
+        self.global_pre = Preprocessor().fit(engines)
+        grouped = {}
+        for rows in engines.values():
+            ids = regime_ids(rows)
+            for r in np.unique(ids):
+                grouped.setdefault(int(r), []).append(rows[ids == r])
+        self.per_regime = {}
+        for r, chunks in grouped.items():
+            if sum(len(c) for c in chunks) < 10:
+                continue
+            fake = {i: c for i, c in enumerate(chunks)}
+            self.per_regime[r] = Preprocessor().fit(fake)
+        return self
+
+    @property
+    def n_features(self):
+        return self.global_pre.n_features
+
+    def transform(self, rows):
+        out = np.empty((len(rows), self.n_features))
+        ids = regime_ids(rows)
+        for r in np.unique(ids):
+            m = ids == r
+            pre = self.per_regime.get(int(r), self.global_pre)
+            out[m] = pre.transform(rows[m])
+        return out
+
+    def to_dict(self):
+        return {"global": self.global_pre.to_dict(),
+                "per_regime": {str(k): v.to_dict() for k, v in self.per_regime.items()}}
+
+    @staticmethod
+    def from_dict(d):
+        rp = RegimePreprocessor()
+        rp.global_pre = Preprocessor(keep=np.asarray(d["global"]["keep"], dtype=int),
+                                     low=np.asarray(d["global"]["low"], dtype=float),
+                                     high=np.asarray(d["global"]["high"], dtype=float))
+        for k, v in d["per_regime"].items():
+            rp.per_regime[int(k)] = Preprocessor(keep=np.asarray(v["keep"], dtype=int),
+                                                 low=np.asarray(v["low"], dtype=float),
+                                                 high=np.asarray(v["high"], dtype=float))
+        return rp
 
 
 # ------------------------- R-CSNF-STYLE RESERVOIR -----------------
@@ -226,8 +289,8 @@ class CSNFReservoir:
         # + flux (P) + raw lag features
         return 7 * self.pool_bins - 1 + self.num_lags * self.input_dim
 
-    def kinetic(self, field):
-        return np.fft.ifft(np.fft.fft(field) * self.propagator)
+    def kinetic(self, field_):
+        return np.fft.ifft(np.fft.fft(field_) * self.propagator)
 
     @staticmethod
     def normalize(psi, phi):
@@ -318,24 +381,39 @@ class CSNFReservoir:
 
 # ------------------------- RIDGE / METRICS ------------------------
 
-def fit_ridge(X, y, regularization=1.0, rcond=READOUT_RCOND):
+def fit_ridge(X, y, regularization=1.0, rcond=READOUT_RCOND, w=None):
+    """Ridge readout on standardized features. If w is given, rows are weighted."""
     X = np.asarray(X, dtype=float)
     y = np.asarray(y, dtype=float)
-    mean = X.mean(axis=0)
-    scale = X.std(axis=0)
+    if w is None:
+        w = np.ones(len(y))
+    w = np.asarray(w, dtype=float)
+    wsum = w.sum()
+    mean = (X * w[:, None]).sum(0) / wsum
+    scale = np.sqrt(((X - mean) ** 2 * w[:, None]).sum(0) / wsum)
     scale[scale < 1e-8] = 1.0
-    Z = (X - mean) / scale
-    y_mean = y.mean()
+    y_mean = float((y * w).sum() / wsum)
+    sw = np.sqrt(w)[:, None]
+    Z = (X - mean) / scale * sw
+    yw = (y - y_mean) * sw[:, 0]
     U, S, Vt = np.linalg.svd(Z, full_matrices=False)
     factors = S / (S ** 2 + regularization)
     if len(S):
         factors[S <= S[0] * rcond] = 0.0
-    weights = Vt.T @ (factors * (U.T @ (y - y_mean)))
-    return {"mean": mean, "scale": scale, "weights": weights, "y_mean": float(y_mean)}
+    weights = Vt.T @ (factors * (U.T @ yw))
+    return {"mean": mean, "scale": scale, "weights": weights, "y_mean": y_mean}
 
 
 def predict_ridge(model, X):
     return ((X - model["mean"]) / model["scale"]) @ model["weights"] + model["y_mean"]
+
+
+def rul_balance_weights(y, bins=RUL_BINS):
+    """Equal total weight per RUL band so the healthy plateau does not dominate the fit."""
+    idx = np.clip(np.digitize(y, bins[1:-1], right=False), 0, len(bins) - 2)
+    counts = np.bincount(idx, minlength=len(bins) - 1).astype(float)
+    counts[counts == 0] = 1.0
+    return (len(y) / (len(bins) - 1)) / counts[idx]
 
 
 def rmse(y_true, y_pred):
@@ -358,6 +436,62 @@ def causal_mean_features(X, window=5):
     for t in range(len(X)):
         result[t] = X[max(0, t - window + 1):t + 1].mean(axis=0)
     return np.hstack([X, result])
+
+
+# ------------------------- POST-PROCESSING ------------------------
+
+def causal_ema_deadband(pred, beta=0.3, deadband=2.0):
+    """Causal smoothing. Inside the deadband the history follows RUL decreasing by one
+    per cycle; outside it the estimate moves a fraction beta toward the new prediction."""
+    out = np.empty_like(pred, dtype=float)
+    out[0] = pred[0]
+    for t in range(1, len(pred)):
+        expected = out[t - 1] - 1.0
+        target = pred[t]
+        if abs(target - expected) < deadband:
+            out[t] = expected
+        else:
+            out[t] = expected + beta * (target - expected)
+    return out
+
+
+def warmup_hold(pred, washout=WASHOUT):
+    """Replace predictions made while the reservoir is unsettled with the first settled value."""
+    if len(pred) <= washout:
+        return pred.copy()
+    out = pred.copy()
+    out[:washout] = pred[washout]
+    return out
+
+
+def postprocess(pred, beta, deadband):
+    p = warmup_hold(np.asarray(pred, dtype=float))
+    p = causal_ema_deadband(p, beta=beta, deadband=deadband)
+    return np.clip(p, 0, R_MAX)
+
+
+# ------------------------- ERROR PROFILE --------------------------
+
+def error_profile(y_true, y_pred, cycles):
+    """Per-band error, used to see where the model's error is concentrated."""
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    cycles = np.asarray(cycles)
+    err = y_pred - y_true
+    rows = []
+    for lo, hi in zip(RUL_BINS[:-1], RUL_BINS[1:]):
+        m = (y_true >= lo) & (y_true < hi)
+        if m.any():
+            rows.append({"rul_band": f"[{lo},{hi})", "n": int(m.sum()),
+                         "rmse": float(np.sqrt(np.mean(err[m] ** 2))),
+                         "bias": float(np.mean(err[m]))})
+    for lo, hi in zip(CYCLE_BINS[:-1], CYCLE_BINS[1:]):
+        m = (cycles >= lo) & (cycles < hi)
+        if m.any():
+            rows.append({"cycle_band": f"[{lo},{hi})", "n": int(m.sum()),
+                         "rmse": float(np.sqrt(np.mean(err[m] ** 2))),
+                         "bias": float(np.mean(err[m]))})
+    return rows
 
 
 # ------------------------- TRIAGE ---------------------------------
@@ -437,6 +571,40 @@ def make_model_version(subset, seed, train_hash, best):
     return hashlib.sha256(raw.encode()).hexdigest()[:12]
 
 
+def model_to_plain(m):
+    return {k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in m.items()}
+
+
+def plain_to_model(d):
+    return {k: (np.asarray(v) if isinstance(v, list) else v) for k, v in d.items()}
+
+
+# ------------------------- TUNING HELPERS -------------------------
+
+def make_items(engines, pp):
+    return [(pp.transform(engines[i]), rul_targets(len(engines[i])), engines[i])
+            for i in sorted(engines)]
+
+
+def best_smoothing(res_model, reservoir, val_items):
+    """Pick (beta, deadband) on validation engines only."""
+    raw = []
+    for X, y, _ in val_items:
+        raw.append((reservoir.run_engine(X), y))
+    best = None
+    for beta in SMOOTH_BETA_GRID:
+        for db in SMOOTH_DEADBAND_GRID:
+            preds, truths = [], []
+            for F, y in raw:
+                p = postprocess(predict_ridge(res_model, F), beta, db)
+                preds.append(p[WASHOUT:])
+                truths.append(y[WASHOUT:])
+            score = rmse(np.concatenate(truths), np.concatenate(preds))
+            if best is None or score < best["score"]:
+                best = {"score": score, "beta": beta, "deadband": db}
+    return best
+
+
 # ------------------------- MAIN PIPELINE --------------------------
 
 def run_pipeline(subset="FD001", data_dir=None, out_dir=None, seed=SEED):
@@ -494,12 +662,7 @@ def run_pipeline(subset="FD001", data_dir=None, out_dir=None, seed=SEED):
 
     if checkpoint is not None:
         best = checkpoint["best"]
-        pre_dict = checkpoint["preprocessor"]
-        pre = Preprocessor(
-            keep=np.asarray(pre_dict["keep"], dtype=int),
-            low=np.asarray(pre_dict["low"], dtype=float),
-            high=np.asarray(pre_dict["high"], dtype=float),
-        )
+        pre = RegimePreprocessor.from_dict(checkpoint["preprocessor"])
         cfg = checkpoint["reservoir_config"]
         reservoir = CSNFReservoir(
             input_dim=cfg["input_dim"],
@@ -508,20 +671,16 @@ def run_pipeline(subset="FD001", data_dir=None, out_dir=None, seed=SEED):
         )
         model = plain_to_model(checkpoint["reservoir_model"])
         baseline = plain_to_model(checkpoint["baseline_model"])
-        log("[RESUME] Skipped validation tuning and final training; continuing at test evaluation.")
+        smooth = checkpoint["smoothing"]
+        log("[RESUME] Skipped tuning and final training; continuing at test evaluation.")
     else:
         log("[2] Engine-level validation split")
         fit_ids, val_ids = split_engine_ids(train_engines.keys(), seed=seed)
         fit_engines = {i: train_engines[i] for i in fit_ids}
         val_engines = {i: train_engines[i] for i in val_ids}
 
-        log("[3] Validation tuning")
-        pre_val = Preprocessor().fit(fit_engines)
-
-        def make_items(engines, pp):
-            return [(pp.transform(engines[i]), rul_targets(len(engines[i])))
-                    for i in sorted(engines)]
-
+        log("[3] Validation tuning (reservoir, readout lambda)")
+        pre_val = RegimePreprocessor().fit(fit_engines)
         fit_items = make_items(fit_engines, pre_val)
         val_items = make_items(val_engines, pre_val)
 
@@ -530,33 +689,43 @@ def run_pipeline(subset="FD001", data_dir=None, out_dir=None, seed=SEED):
             for width in GRID_SEARCH_WIDTH:
                 res = CSNFReservoir(input_dim=pre_val.n_features,
                                     alpha_inject=alpha, packet_width=width)
-                X_fit = np.vstack([res.run_engine(X)[WASHOUT:] for X, _ in fit_items])
-                y_fit = np.concatenate([y[WASHOUT:] for _, y in fit_items])
-                X_val = np.vstack([res.run_engine(X)[WASHOUT:] for X, _ in val_items])
-                y_val = np.concatenate([y[WASHOUT:] for _, y in val_items])
+                X_fit = np.vstack([res.run_engine(X)[WASHOUT:] for X, _, _ in fit_items])
+                y_fit = np.concatenate([y[WASHOUT:] for _, y, _ in fit_items])
+                w_fit = rul_balance_weights(y_fit)
+                X_val = [res.run_engine(X) for X, _, _ in val_items]
                 for lam in GRID_SEARCH_LAMBDA:
-                    candidate_model = fit_ridge(X_fit, y_fit, lam)
-                    pred = np.clip(predict_ridge(candidate_model, X_val), 0, R_MAX)
-                    score = rmse(y_val, pred)
+                    cand = fit_ridge(X_fit, y_fit, lam, w=w_fit)
+                    preds = [np.clip(predict_ridge(cand, F)[WASHOUT:], 0, R_MAX)
+                             for F in X_val]
+                    truths = [y[WASHOUT:] for _, y, _ in val_items]
+                    score = rmse(np.concatenate(truths), np.concatenate(preds))
                     log(f"  alpha={alpha} width={width} lambda={lam}: val RMSE={score:.3f}")
                     if best is None or score < best["score"]:
                         best = {"score": score, "alpha": alpha, "width": width, "lambda": lam}
         log(f"Best reservoir settings: {best}")
 
+        log("[3b] Validation tuning (causal smoothing)")
+        res_best = CSNFReservoir(input_dim=pre_val.n_features,
+                                 alpha_inject=best["alpha"], packet_width=best["width"])
+        X_fit = np.vstack([res_best.run_engine(X)[WASHOUT:] for X, _, _ in fit_items])
+        y_fit = np.concatenate([y[WASHOUT:] for _, y, _ in fit_items])
+        cand_model = fit_ridge(X_fit, y_fit, best["lambda"], w=rul_balance_weights(y_fit))
+        smooth = best_smoothing(cand_model, res_best, val_items)
+        log(f"Best smoothing: {smooth}")
+
         log("[4] Final training on all training engines")
-        pre = Preprocessor().fit(train_engines)
+        pre = RegimePreprocessor().fit(train_engines)
         train_items = make_items(train_engines, pre)
         reservoir = CSNFReservoir(input_dim=pre.n_features,
                                   alpha_inject=best["alpha"], packet_width=best["width"])
-        X_train = np.vstack([reservoir.run_engine(X)[WASHOUT:] for X, _ in train_items])
-        y_train = np.concatenate([y[WASHOUT:] for _, y in train_items])
-        model = fit_ridge(X_train, y_train, best["lambda"])
+        X_train = np.vstack([reservoir.run_engine(X)[WASHOUT:] for X, _, _ in train_items])
+        y_train = np.concatenate([y[WASHOUT:] for _, y, _ in train_items])
+        w_train = rul_balance_weights(y_train)
+        model = fit_ridge(X_train, y_train, best["lambda"], w=w_train)
 
-        B_train = np.vstack([causal_mean_features(X)[WASHOUT:] for X, _ in train_items])
-        baseline = fit_ridge(B_train, y_train, best["lambda"])
+        B_train = np.vstack([causal_mean_features(X)[WASHOUT:] for X, _, _ in train_items])
+        baseline = fit_ridge(B_train, y_train, best["lambda"], w=w_train)
 
-        # Save the expensive training result before the test-evaluation stage.
-        # The checkpoint is reusable only for the same dataset hashes and settings.
         checkpoint_payload = {
             "pipeline_version": __version__,
             "subset": subset,
@@ -564,6 +733,7 @@ def run_pipeline(subset="FD001", data_dir=None, out_dir=None, seed=SEED):
             "train_sha256": train_hash,
             "test_sha256": test_hash,
             "best": best,
+            "smoothing": smooth,
             "preprocessor": pre.to_dict(),
             "reservoir_config": {
                 "alpha_inject": best["alpha"],
@@ -579,10 +749,12 @@ def run_pipeline(subset="FD001", data_dir=None, out_dir=None, seed=SEED):
     log("[5] Test evaluation (same protocol for both models: last cycle of each test engine)")
     truth_capped = np.minimum(test_rul, R_MAX)
     engines_out, res_last, base_last = [], [], []
+    prof_true, prof_pred, prof_cyc = [], [], []
     for i, engine_id in enumerate(test_ids):
         rows = test_engines[engine_id]
         X = pre.transform(rows)
-        res_pred = np.clip(predict_ridge(model, reservoir.run_engine(X)), 0, R_MAX)
+        raw_res = predict_ridge(model, reservoir.run_engine(X))
+        res_pred = postprocess(raw_res, smooth["beta"], smooth["deadband"])
         base_pred = np.clip(predict_ridge(baseline, causal_mean_features(X)), 0, R_MAX)
         res_last.append(res_pred[-1])
         base_last.append(base_pred[-1])
@@ -597,9 +769,17 @@ def run_pipeline(subset="FD001", data_dir=None, out_dir=None, seed=SEED):
             "history": [round(float(v), 2) for v in res_pred],
             "sensors": {f"s{k}": float(rows[-1][4 + k]) for k in range(1, 22)},
         })
+        # Profile over every observed cycle, using the engine's known end-of-life RUL.
+        end_truth = rul_targets(len(rows))
+        prof_true.append(end_truth)
+        prof_pred.append(res_pred)
+        prof_cyc.append(np.arange(1, len(rows) + 1))
 
     res_last = np.asarray(res_last)
     base_last = np.asarray(base_last)
+    profile = error_profile(np.concatenate(prof_true), np.concatenate(prof_pred),
+                            np.concatenate(prof_cyc))
+
     metrics = {
         "subset": subset,
         "pipeline_version": __version__,
@@ -609,6 +789,7 @@ def run_pipeline(subset="FD001", data_dir=None, out_dir=None, seed=SEED):
         "test_sha256": test_hash,
         "test_engines": len(test_ids),
         "best_parameters": best,
+        "smoothing": smooth,
         "reservoir": {
             "rmse_capped": rmse(truth_capped, res_last),
             "mae_capped": mae(truth_capped, res_last),
@@ -621,11 +802,14 @@ def run_pipeline(subset="FD001", data_dir=None, out_dir=None, seed=SEED):
             "rmse_uncapped": rmse(test_rul, base_last),
             "phm_score_uncapped": phm_score(base_last, test_rul),
         },
+        "error_profile": profile,
     }
     model_version = make_model_version(subset, seed, train_hash, best)
     metrics["model_version"] = model_version
     for name in ("reservoir", "ridge_baseline"):
         log(f"{name}: " + ", ".join(f"{k}={v:.4f}" for k, v in metrics[name].items()))
+    for row in profile:
+        log("  profile: " + json.dumps(row))
 
     log("[6] Persisting artifact, predictions, work orders and audit log")
     Artifact(
@@ -679,26 +863,17 @@ def run_pipeline(subset="FD001", data_dir=None, out_dir=None, seed=SEED):
     return metrics
 
 
-def model_to_plain(m):
-    return {k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in m.items()}
-
-
-def plain_to_model(d):
-    return {k: (np.asarray(v) if isinstance(v, list) else v) for k, v in d.items()}
-
-
 def predict_with_artifact(artifact, rows):
     """Reproduce predictions for one engine's raw rows from a saved artifact."""
-    pre = Preprocessor(keep=np.asarray(artifact.preprocessor["keep"]),
-                       low=np.asarray(artifact.preprocessor["low"]),
-                       high=np.asarray(artifact.preprocessor["high"]))
+    pre = RegimePreprocessor.from_dict(artifact.preprocessor)
     cfg = artifact.reservoir_config
     res = CSNFReservoir(input_dim=cfg["input_dim"],
                         alpha_inject=cfg["alpha_inject"],
                         packet_width=cfg["packet_width"])
     X = pre.transform(rows)
-    return np.clip(predict_ridge(plain_to_model(artifact.reservoir_model),
-                                 res.run_engine(X)), 0, R_MAX)
+    raw = predict_ridge(plain_to_model(artifact.reservoir_model), res.run_engine(X))
+    return postprocess(raw, artifact.best_parameters.get("beta", 0.4),
+                       artifact.best_parameters.get("deadband", 2.0))
 
 
 # ------------------------- SELF-TEST ------------------------------
@@ -711,8 +886,11 @@ def run_selftest():
     res = CSNFReservoir(input_dim=4, grid_n=64, pool_bins=8)
     F = res.run_engine(X)
     assert F.shape == (30, res.n_features_out) and np.isfinite(F).all()
-    pred = predict_ridge(fit_ridge(F, y, 1e-4), F)
+    w = rul_balance_weights(y)
+    pred = predict_ridge(fit_ridge(F, y, 1e-4, w=w), F)
     assert pred.shape == y.shape and np.isfinite(pred).all()
+    s = causal_ema_deadband(np.linspace(30, 0, 30), beta=0.4, deadband=2.0)
+    assert s.shape == (30,) and np.isfinite(s).all()
     assert severity_band(5) == "critical"
     assert severity_band(20) == "high"
     assert severity_band(45) == "medium"
