@@ -23,18 +23,17 @@ import numpy as np
 
 import store
 
-__version__ = "1.2.0"
+__version__ = "1.1.0"
 
 SUBSETS = ("FD001", "FD002", "FD003", "FD004")
 R_MAX = 125.0
-WASHOUT = 30
+WASHOUT = 20
 VAL_FRACTION = 0.20
 SEED = 0
 N_COLS = 26
-GRID_SEARCH_ALPHA = (0.35, 0.65)
+GRID_SEARCH_ALPHA = (0.4, 0.7)
 GRID_SEARCH_WIDTH = (0.25, 0.35)
-GRID_SEARCH_LAMBDA = (1e-4,)
-READOUT_RCOND = 1e-4
+GRID_SEARCH_LAMBDA = (0.1, 1.0, 10.0, 100.0)
 
 
 def log(msg):
@@ -196,8 +195,8 @@ class CSNFReservoir:
     """Deterministic recurrent complex-valued reservoir inspired by
     split-step Schrödinger field dynamics."""
 
-    def __init__(self, input_dim, grid_n=64, num_lags=3, pool_bins=8,
-                 evolve_steps=8, alpha_inject=0.6, packet_width=0.35,
+    def __init__(self, input_dim, grid_n=32, num_lags=3, pool_bins=8,
+                 evolve_steps=5, alpha_inject=0.6, packet_width=0.35,
                  diffusion=0.01, potential=0.4):
         if input_dim < 1:
             raise ValueError("input_dim must be positive")
@@ -210,7 +209,6 @@ class CSNFReservoir:
         self.evolve_steps = evolve_steps
         self.alpha = alpha_inject
         self.packet_width = packet_width
-        self.coupling_amplitude = np.log(2.0)
         self.length = 2 * np.pi
         self.x = np.linspace(0, self.length, grid_n, endpoint=False)
         dx = self.length / grid_n
@@ -222,9 +220,7 @@ class CSNFReservoir:
 
     @property
     def n_features_out(self):
-        # |psi|^2 (P) + |phi|^2 without last bin (P-1) + 4 real/imag parts (4P)
-        # + flux (P) + raw lag features
-        return 7 * self.pool_bins - 1 + self.num_lags * self.input_dim
+        return 7 * self.pool_bins + self.num_lags * self.input_dim
 
     def kinetic(self, field):
         return np.fft.ifft(np.fft.fft(field) * self.propagator)
@@ -266,7 +262,7 @@ class CSNFReservoir:
         for step in range(self.evolve_steps):
             psi = self.kinetic(psi)
             phi = self.kinetic(phi)
-            coupling = self.coupling_amplitude * np.exp(-1j * (step + 0.5))
+            coupling = 0.1 * np.exp(-1j * (step + 0.5))
             psi_old = psi.copy()
             psi = psi * self.vpsi - 1j * coupling * phi
             phi = phi * self.vphi - 1j * np.conj(coupling) * psi_old
@@ -295,7 +291,7 @@ class CSNFReservoir:
 
         derivative = np.fft.ifft(1j * self.k * np.fft.fft(psi))
         values = np.concatenate([
-            pool(np.abs(psi) ** 2), pool(np.abs(phi) ** 2)[:-1],
+            pool(np.abs(psi) ** 2), pool(np.abs(phi) ** 2),
             pool(psi.real), pool(psi.imag),
             pool(phi.real), pool(phi.imag),
             pool(np.imag(np.conj(psi) * derivative)),
@@ -318,7 +314,7 @@ class CSNFReservoir:
 
 # ------------------------- RIDGE / METRICS ------------------------
 
-def fit_ridge(X, y, regularization=1.0, rcond=READOUT_RCOND):
+def fit_ridge(X, y, regularization=1.0):
     X = np.asarray(X, dtype=float)
     y = np.asarray(y, dtype=float)
     mean = X.mean(axis=0)
@@ -329,7 +325,7 @@ def fit_ridge(X, y, regularization=1.0, rcond=READOUT_RCOND):
     U, S, Vt = np.linalg.svd(Z, full_matrices=False)
     factors = S / (S ** 2 + regularization)
     if len(S):
-        factors[S <= S[0] * rcond] = 0.0
+        factors[S <= S[0] * 1e-10] = 0.0
     weights = Vt.T @ (factors * (U.T @ (y - y_mean)))
     return {"mean": mean, "scale": scale, "weights": weights, "y_mean": float(y_mean)}
 
@@ -708,10 +704,10 @@ def run_selftest():
     rng = np.random.default_rng(123)
     X = rng.normal(size=(30, 4))
     y = np.linspace(30, 0, 30)
-    res = CSNFReservoir(input_dim=4, grid_n=64, pool_bins=8)
+    res = CSNFReservoir(input_dim=4, grid_n=32, pool_bins=8)
     F = res.run_engine(X)
     assert F.shape == (30, res.n_features_out) and np.isfinite(F).all()
-    pred = predict_ridge(fit_ridge(F, y, 1e-4), F)
+    pred = predict_ridge(fit_ridge(F, y, 1.0), F)
     assert pred.shape == y.shape and np.isfinite(pred).all()
     assert severity_band(5) == "critical"
     assert severity_band(20) == "high"
