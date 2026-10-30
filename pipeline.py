@@ -203,24 +203,30 @@ class Preprocessor:
 
 @dataclass
 class RegimePreprocessor:
-    """One Preprocessor per operating regime. Regimes unseen in training fall back
-    to a global Preprocessor fitted on all training rows."""
+    """One set of min/max bounds per operating regime, all over the same feature
+    columns (the global keep set) so every regime yields the same width.
+    Regimes with too few rows fall back to the global bounds."""
     per_regime: dict = field(default_factory=dict)
     global_pre: Preprocessor | None = None
 
     def fit(self, engines):
         self.global_pre = Preprocessor().fit(engines)
+        keep = self.global_pre.keep
+
         grouped = {}
         for rows in engines.values():
             ids = regime_ids(rows)
             for r in np.unique(ids):
-                grouped.setdefault(int(r), []).append(rows[ids == r])
+                grouped.setdefault(int(r), []).append(rows[ids == r][:, 2:][:, keep])
+
         self.per_regime = {}
         for r, chunks in grouped.items():
-            if sum(len(c) for c in chunks) < 10:
+            mat = np.vstack(chunks)
+            if len(mat) < 10:
                 continue
-            fake = {i: c for i, c in enumerate(chunks)}
-            self.per_regime[r] = Preprocessor().fit(fake)
+            self.per_regime[r] = Preprocessor(keep=keep,
+                                              low=mat.min(axis=0),
+                                              high=mat.max(axis=0))
         return self
 
     @property
@@ -872,8 +878,8 @@ def predict_with_artifact(artifact, rows):
                         packet_width=cfg["packet_width"])
     X = pre.transform(rows)
     raw = predict_ridge(plain_to_model(artifact.reservoir_model), res.run_engine(X))
-    return postprocess(raw, artifact.best_parameters.get("beta", 0.4),
-                       artifact.best_parameters.get("deadband", 2.0))
+    smooth = artifact.best_parameters.get("smoothing", {"beta": 0.4, "deadband": 2.0})
+    return postprocess(raw, smooth["beta"], smooth["deadband"])
 
 
 # ------------------------- SELF-TEST ------------------------------
