@@ -23,18 +23,28 @@ import numpy as np
 
 import store
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 SUBSETS = ("FD001", "FD002", "FD003", "FD004")
 R_MAX = 125.0
-WASHOUT = 30
+WASHOUT = 30                       # rcsnf.py washout
 VAL_FRACTION = 0.20
 SEED = 0
 N_COLS = 26
-GRID_SEARCH_ALPHA = (0.35, 0.65)
+
+# Reservoir defaults taken from rcsnf.py
+EVOLVE_STEPS = 10                  # rcsnf.py evolve_steps
+ALPHA_INJECT = 0.60                # rcsnf.py alpha_inject
+DIFFUSION = 0.01                   # rcsnf.py D_psi = D_phi
+POTENTIAL = 0.4                    # rcsnf.py V_amp_psi = V_amp_phi
+POOL_BINS = 8                      # rcsnf.py pool_bins
+GRID_N = 64                        # rcsnf.py grid_n
+NUM_LAGS = 3
+
+# Search spaces (validation only)
 GRID_SEARCH_WIDTH = (0.25, 0.35)
-GRID_SEARCH_LAMBDA = (1e-6, 1e-5, 1e-4, 1e-3, 1e-2)
-READOUT_RCOND = 1e-4
+GRID_SEARCH_LAMBDA = (1e-5, 1e-4, 1e-3)
+READOUT_RCOND = 1e-4               # rcsnf.py rcond
 RUL_BINS = (0, 10, 30, 60, 90, 126)
 CYCLE_BINS = (1, 30, 60, 100, 10**6)
 SMOOTH_BETA_GRID = (0.2, 0.4, 0.6)
@@ -54,7 +64,6 @@ def extract_zips(data_dir):
     archives = sorted(glob.glob(os.path.join(root, "**", "*.zip"), recursive=True))
 
     for zip_path in archives:
-        # Avoid repeatedly extracting an archive into itself or processing the same file.
         with zipfile.ZipFile(zip_path) as archive:
             for member in archive.infolist():
                 target = os.path.realpath(os.path.join(root, member.filename))
@@ -96,7 +105,6 @@ def locate_dataset(subset, data_dir):
         if not hits:
             missing.append(filename)
         else:
-            # Prefer a direct child of data_dir, then a deterministic nested path.
             paths[key] = min(
                 hits,
                 key=lambda candidate: (os.path.dirname(candidate) != data_dir, candidate),
@@ -194,7 +202,7 @@ class Preprocessor:
     def transform(self, rows):
         x = rows[:, 2:][:, self.keep]
         span = np.maximum(self.high - self.low, 1e-12)
-        return (x - self.low) / span  # test values outside training range are not clipped
+        return (x - self.low) / span
 
     def to_dict(self):
         return {"keep": self.keep.tolist(), "low": self.low.tolist(),
@@ -203,9 +211,8 @@ class Preprocessor:
 
 @dataclass
 class RegimePreprocessor:
-    """One set of min/max bounds per operating regime, all over the same feature
-    columns (the global keep set) so every regime yields the same width.
-    Regimes with too few rows fall back to the global bounds."""
+    """Per-regime min/max bounds over the global keep set, so every regime yields
+    the same width. Regimes with too few rows fall back to the global bounds."""
     per_regime: dict = field(default_factory=dict)
     global_pre: Preprocessor | None = None
 
@@ -259,15 +266,16 @@ class RegimePreprocessor:
         return rp
 
 
-# ------------------------- R-CSNF-STYLE RESERVOIR -----------------
+# ------------------------- RECURRENT CSNF RESERVOIR ---------------
 
 class CSNFReservoir:
-    """Deterministic recurrent complex-valued reservoir inspired by
-    split-step Schrödinger field dynamics."""
+    """Recurrent complex-valued reservoir (split-step field dynamics), with
+    parameters matching rcsnf.py defaults."""
 
-    def __init__(self, input_dim, grid_n=64, num_lags=3, pool_bins=8,
-                 evolve_steps=8, alpha_inject=0.6, packet_width=0.35,
-                 diffusion=0.01, potential=0.4):
+    def __init__(self, input_dim, grid_n=GRID_N, num_lags=NUM_LAGS,
+                 pool_bins=POOL_BINS, evolve_steps=EVOLVE_STEPS,
+                 alpha_inject=ALPHA_INJECT, packet_width=0.35,
+                 diffusion=DIFFUSION, potential=POTENTIAL):
         if input_dim < 1:
             raise ValueError("input_dim must be positive")
         if grid_n % pool_bins:
@@ -387,8 +395,9 @@ class CSNFReservoir:
 
 # ------------------------- RIDGE / METRICS ------------------------
 
-def fit_ridge(X, y, regularization=1.0, rcond=READOUT_RCOND, w=None):
-    """Ridge readout on standardized features. If w is given, rows are weighted."""
+def fit_ridge(X, y, regularization=1e-4, rcond=READOUT_RCOND, w=None):
+    """Ridge readout on standardized features with SVD truncation.
+    Optional per-row weights w."""
     X = np.asarray(X, dtype=float)
     y = np.asarray(y, dtype=float)
     if w is None:
@@ -479,7 +488,6 @@ def postprocess(pred, beta, deadband):
 # ------------------------- ERROR PROFILE --------------------------
 
 def error_profile(y_true, y_pred, cycles):
-    """Per-band error, used to see where the model's error is concentrated."""
     y_true = np.asarray(y_true, dtype=float)
     y_pred = np.asarray(y_pred, dtype=float)
     cycles = np.asarray(cycles)
@@ -594,9 +602,7 @@ def make_items(engines, pp):
 
 def best_smoothing(res_model, reservoir, val_items):
     """Pick (beta, deadband) on validation engines only."""
-    raw = []
-    for X, y, _ in val_items:
-        raw.append((reservoir.run_engine(X), y))
+    raw = [(reservoir.run_engine(X), y) for X, y, _ in val_items]
     best = None
     for beta in SMOOTH_BETA_GRID:
         for db in SMOOTH_DEADBAND_GRID:
@@ -614,7 +620,6 @@ def best_smoothing(res_model, reservoir, val_items):
 # ------------------------- MAIN PIPELINE --------------------------
 
 def run_pipeline(subset="FD001", data_dir=None, out_dir=None, seed=SEED):
-    # Honour container/runtime configuration even when callers omit explicit paths.
     data_dir = data_dir or os.environ.get("AERO_DATA_DIR", "data")
     out_dir = out_dir or os.environ.get("AERO_OUT_DIR", "runs")
     if subset not in SUBSETS:
@@ -638,7 +643,6 @@ def run_pipeline(subset="FD001", data_dir=None, out_dir=None, seed=SEED):
     checkpoint_path = os.path.join(run_dir, "training_checkpoint.pkl")
 
     def atomic_pickle_save(payload, path):
-        """Write checkpoint atomically so an interrupted write cannot corrupt it."""
         temp_path = path + ".tmp"
         with open(temp_path, "wb") as handle:
             pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
@@ -670,11 +674,9 @@ def run_pipeline(subset="FD001", data_dir=None, out_dir=None, seed=SEED):
         best = checkpoint["best"]
         pre = RegimePreprocessor.from_dict(checkpoint["preprocessor"])
         cfg = checkpoint["reservoir_config"]
-        reservoir = CSNFReservoir(
-            input_dim=cfg["input_dim"],
-            alpha_inject=cfg["alpha_inject"],
-            packet_width=cfg["packet_width"],
-        )
+        reservoir = CSNFReservoir(input_dim=cfg["input_dim"],
+                                  alpha_inject=cfg["alpha_inject"],
+                                  packet_width=cfg["packet_width"])
         model = plain_to_model(checkpoint["reservoir_model"])
         baseline = plain_to_model(checkpoint["baseline_model"])
         smooth = checkpoint["smoothing"]
@@ -685,34 +687,31 @@ def run_pipeline(subset="FD001", data_dir=None, out_dir=None, seed=SEED):
         fit_engines = {i: train_engines[i] for i in fit_ids}
         val_engines = {i: train_engines[i] for i in val_ids}
 
-        log("[3] Validation tuning (reservoir, readout lambda)")
+        log("[3] Validation tuning (packet width, readout lambda)")
         pre_val = RegimePreprocessor().fit(fit_engines)
         fit_items = make_items(fit_engines, pre_val)
         val_items = make_items(val_engines, pre_val)
 
         best = None
-        for alpha in GRID_SEARCH_ALPHA:
-            for width in GRID_SEARCH_WIDTH:
-                res = CSNFReservoir(input_dim=pre_val.n_features,
-                                    alpha_inject=alpha, packet_width=width)
-                X_fit = np.vstack([res.run_engine(X)[WASHOUT:] for X, _, _ in fit_items])
-                y_fit = np.concatenate([y[WASHOUT:] for _, y, _ in fit_items])
-                w_fit = rul_balance_weights(y_fit)
-                X_val = [res.run_engine(X) for X, _, _ in val_items]
-                for lam in GRID_SEARCH_LAMBDA:
-                    cand = fit_ridge(X_fit, y_fit, lam, w=w_fit)
-                    preds = [np.clip(predict_ridge(cand, F)[WASHOUT:], 0, R_MAX)
-                             for F in X_val]
-                    truths = [y[WASHOUT:] for _, y, _ in val_items]
-                    score = rmse(np.concatenate(truths), np.concatenate(preds))
-                    log(f"  alpha={alpha} width={width} lambda={lam}: val RMSE={score:.3f}")
-                    if best is None or score < best["score"]:
-                        best = {"score": score, "alpha": alpha, "width": width, "lambda": lam}
+        for width in GRID_SEARCH_WIDTH:
+            res = CSNFReservoir(input_dim=pre_val.n_features, packet_width=width)
+            X_fit = np.vstack([res.run_engine(X)[WASHOUT:] for X, _, _ in fit_items])
+            y_fit = np.concatenate([y[WASHOUT:] for _, y, _ in fit_items])
+            w_fit = rul_balance_weights(y_fit)
+            X_val = [res.run_engine(X) for X, _, _ in val_items]
+            truths = [y[WASHOUT:] for _, y, _ in val_items]
+            for lam in GRID_SEARCH_LAMBDA:
+                cand = fit_ridge(X_fit, y_fit, lam, w=w_fit)
+                preds = [np.clip(predict_ridge(cand, F)[WASHOUT:], 0, R_MAX) for F in X_val]
+                score = rmse(np.concatenate(truths), np.concatenate(preds))
+                log(f"  width={width} lambda={lam}: val RMSE={score:.3f}")
+                if best is None or score < best["score"]:
+                    best = {"score": score, "alpha": ALPHA_INJECT,
+                            "width": width, "lambda": lam}
         log(f"Best reservoir settings: {best}")
 
         log("[3b] Validation tuning (causal smoothing)")
-        res_best = CSNFReservoir(input_dim=pre_val.n_features,
-                                 alpha_inject=best["alpha"], packet_width=best["width"])
+        res_best = CSNFReservoir(input_dim=pre_val.n_features, packet_width=best["width"])
         X_fit = np.vstack([res_best.run_engine(X)[WASHOUT:] for X, _, _ in fit_items])
         y_fit = np.concatenate([y[WASHOUT:] for _, y, _ in fit_items])
         cand_model = fit_ridge(X_fit, y_fit, best["lambda"], w=rul_balance_weights(y_fit))
@@ -722,8 +721,7 @@ def run_pipeline(subset="FD001", data_dir=None, out_dir=None, seed=SEED):
         log("[4] Final training on all training engines")
         pre = RegimePreprocessor().fit(train_engines)
         train_items = make_items(train_engines, pre)
-        reservoir = CSNFReservoir(input_dim=pre.n_features,
-                                  alpha_inject=best["alpha"], packet_width=best["width"])
+        reservoir = CSNFReservoir(input_dim=pre.n_features, packet_width=best["width"])
         X_train = np.vstack([reservoir.run_engine(X)[WASHOUT:] for X, _, _ in train_items])
         y_train = np.concatenate([y[WASHOUT:] for _, y, _ in train_items])
         w_train = rul_balance_weights(y_train)
@@ -742,7 +740,7 @@ def run_pipeline(subset="FD001", data_dir=None, out_dir=None, seed=SEED):
             "smoothing": smooth,
             "preprocessor": pre.to_dict(),
             "reservoir_config": {
-                "alpha_inject": best["alpha"],
+                "alpha_inject": ALPHA_INJECT,
                 "packet_width": best["width"],
                 "input_dim": pre.n_features,
             },
@@ -775,9 +773,7 @@ def run_pipeline(subset="FD001", data_dir=None, out_dir=None, seed=SEED):
             "history": [round(float(v), 2) for v in res_pred],
             "sensors": {f"s{k}": float(rows[-1][4 + k]) for k in range(1, 22)},
         })
-        # Profile over every observed cycle, using the engine's known end-of-life RUL.
-        end_truth = rul_targets(len(rows))
-        prof_true.append(end_truth)
+        prof_true.append(rul_targets(len(rows)))
         prof_pred.append(res_pred)
         prof_cyc.append(np.arange(1, len(rows) + 1))
 
@@ -820,8 +816,9 @@ def run_pipeline(subset="FD001", data_dir=None, out_dir=None, seed=SEED):
     log("[6] Persisting artifact, predictions, work orders and audit log")
     Artifact(
         model_version=model_version, subset=subset, seed=seed,
-        best_parameters=best, preprocessor=pre.to_dict(),
-        reservoir_config={"alpha_inject": best["alpha"],
+        best_parameters={**best, "smoothing": smooth},
+        preprocessor=pre.to_dict(),
+        reservoir_config={"alpha_inject": ALPHA_INJECT,
                           "packet_width": best["width"],
                           "input_dim": pre.n_features},
         reservoir_model=model_to_plain(model),
@@ -878,7 +875,7 @@ def predict_with_artifact(artifact, rows):
                         packet_width=cfg["packet_width"])
     X = pre.transform(rows)
     raw = predict_ridge(plain_to_model(artifact.reservoir_model), res.run_engine(X))
-    smooth = artifact.best_parameters.get("smoothing", {"beta": 0.4, "deadband": 2.0})
+    smooth = artifact.best_parameters["smoothing"]
     return postprocess(raw, smooth["beta"], smooth["deadband"])
 
 
@@ -889,7 +886,7 @@ def run_selftest():
     rng = np.random.default_rng(123)
     X = rng.normal(size=(30, 4))
     y = np.linspace(30, 0, 30)
-    res = CSNFReservoir(input_dim=4, grid_n=64, pool_bins=8)
+    res = CSNFReservoir(input_dim=4)
     F = res.run_engine(X)
     assert F.shape == (30, res.n_features_out) and np.isfinite(F).all()
     w = rul_balance_weights(y)
