@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """
-AERO-SYNAPSE pipeline.
-NASA C-MAPSS RUL prediction -> deterministic triage -> SQLite + audit log.
+AERO-SYNAPSE pipeline (R-CSNF v3 reservoir, C-MAPSS RUL prediction).
 
-  python pipeline.py --subset FD001 --data-dir data --out-dir runs
   python pipeline.py --selftest
+  python pipeline.py --subset FD001 --data-dir data --out-dir runs
+  python pipeline.py --subset FD001 --trials 16 --seed 0
+
+Protocol
+  * Engine-level validation split on the training engines (no leakage).
+  * Hyperparameters chosen by RANDOM SEARCH over the paper's search spaces
+    (R-CSNF v3 row of Table 1), with a fixed trial budget.
+  * Selection uses validation RUL RMSE only. The test set is scored once.
+  * Test score = last cycle of each test engine vs. the official RUL file.
 """
 from __future__ import annotations
 
@@ -15,7 +22,6 @@ import io
 import json
 import os
 import pickle
-import sqlite3
 import zipfile
 from dataclasses import dataclass, asdict, field
 
@@ -23,17 +29,36 @@ import numpy as np
 
 import store
 
-__version__ = "1.1.0"
+__version__ = "2.0.0"
 
 SUBSETS = ("FD001", "FD002", "FD003", "FD004")
-R_MAX = 125.0
-WASHOUT = 20
+R_MAX = 125.0                 # RUL cap used in training (standard C-MAPSS practice)
+N_COLS = 26
 VAL_FRACTION = 0.20
 SEED = 0
-N_COLS = 26
-GRID_SEARCH_ALPHA = (0.4, 0.7)
-GRID_SEARCH_WIDTH = (0.25, 0.35)
-GRID_SEARCH_LAMBDA = (0.1, 1.0, 10.0, 100.0)
+
+# Reservoir defaults (paper Sec. 7.6 and rcsnf.py)
+GRID_N = 64
+POOL_BINS = 8
+NUM_LAGS = 3
+EVOLVE_STEPS = 10
+POTENTIAL = 0.4
+WASHOUT = 30
+
+# Search spaces (paper Table 1, R-CSNF v3 row). All selection is on validation.
+SEARCH_ALPHA = (0.1, 0.9)        # injection strength, uniform
+SEARCH_DIFFUSION = (1e-4, 1e-1)  # propagation strength, log-uniform
+SEARCH_WIDTH = (0.15, 0.5)       # packet width, uniform
+SEARCH_LAMBDA = (1e-6, 1e-2)     # readout penalty, log-uniform
+DEFAULT_TRIALS = 16              # equal-budget trials, as in paper Fig. 3
+BALANCE_RUL = True               # RUL-band row weighting (ablation switch)
+
+# Post-processing grid (tuned on validation only)
+SMOOTH_BETA_GRID = (0.2, 0.4, 0.6)
+SMOOTH_DEADBAND_GRID = (1.0, 2.0, 4.0)
+
+RUL_BINS = (0, 10, 30, 60, 90, 126)
+CYCLE_BINS = (1, 30, 60, 100, 10**6)
 
 
 def log(msg):
@@ -43,13 +68,10 @@ def log(msg):
 # ------------------------- DATA DISCOVERY -------------------------
 
 def extract_zips(data_dir):
-    """Safely extract ZIP archives found under data_dir, including nested folders."""
+    """Safely extract ZIP archives under data_dir (nested folders included)."""
     root = os.path.realpath(data_dir)
     os.makedirs(root, exist_ok=True)
-    archives = sorted(glob.glob(os.path.join(root, "**", "*.zip"), recursive=True))
-
-    for zip_path in archives:
-        # Avoid repeatedly extracting an archive into itself or processing the same file.
+    for zip_path in sorted(glob.glob(os.path.join(root, "**", "*.zip"), recursive=True)):
         with zipfile.ZipFile(zip_path) as archive:
             for member in archive.infolist():
                 target = os.path.realpath(os.path.join(root, member.filename))
@@ -60,50 +82,31 @@ def extract_zips(data_dir):
 
 
 def locate_dataset(subset, data_dir):
-    """Find required C-MAPSS files regardless of nested ZIP folder structure."""
+    """Find the train/test/RUL files for a subset, wherever they sit under data_dir."""
     data_dir = os.path.abspath(os.path.expanduser(str(data_dir)))
-    log(f"[DATASET] Requested subset: {subset}")
-    log(f"[DATASET] Data directory: {data_dir}")
-
+    log(f"[DATASET] Requested subset: {subset} | data directory: {data_dir}")
     if not os.path.isdir(data_dir):
         raise FileNotFoundError(
             f"Dataset directory does not exist: {data_dir}. "
             "Set AERO_DATA_DIR to the directory containing the C-MAPSS files."
         )
-
     extract_zips(data_dir)
-    wanted = {
-        "train": f"train_{subset}.txt",
-        "test": f"test_{subset}.txt",
-        "rul": f"RUL_{subset}.txt",
-    }
-
-    found_files = {}
+    wanted = {"train": f"train_{subset}.txt",
+              "test": f"test_{subset}.txt",
+              "rul": f"RUL_{subset}.txt"}
+    found = {}
     for root, _, filenames in os.walk(data_dir):
         for filename in filenames:
-            found_files.setdefault(filename, []).append(os.path.join(root, filename))
-
-    log(f"[DATASET] Files discovered: {sorted(found_files)[:100]}")
-    paths = {}
-    missing = []
+            found.setdefault(filename, []).append(os.path.join(root, filename))
+    paths, missing = {}, []
     for key, filename in wanted.items():
-        hits = sorted(found_files.get(filename, []))
+        hits = sorted(found.get(filename, []))
         if not hits:
             missing.append(filename)
         else:
-            # Prefer a direct child of data_dir, then a deterministic nested path.
-            paths[key] = min(
-                hits,
-                key=lambda candidate: (os.path.dirname(candidate) != data_dir, candidate),
-            )
-
+            paths[key] = min(hits, key=lambda c: (os.path.dirname(c) != data_dir, c))
     if missing:
-        raise FileNotFoundError(
-            f"Missing required C-MAPSS file(s): {', '.join(missing)}. "
-            f"Searched recursively under {data_dir}. "
-            f"Discovered files: {sorted(found_files)[:100]}"
-        )
-
+        raise FileNotFoundError(f"Missing C-MAPSS file(s): {', '.join(missing)} under {data_dir}")
     log(f"[DATASET] Resolved paths: {paths}")
     return paths
 
@@ -143,6 +146,7 @@ def group_engines(data, source):
 
 
 def rul_targets(n_cycles, cap=R_MAX):
+    """Piecewise-linear RUL for a training engine that fails at its last cycle."""
     return np.minimum(np.arange(n_cycles - 1, -1, -1, dtype=float), cap)
 
 
@@ -158,46 +162,101 @@ def split_engine_ids(ids, fraction=VAL_FRACTION, seed=SEED):
 
 # ------------------------- PREPROCESSING --------------------------
 
+def regime_ids(rows):
+    """Operating-condition cluster per row (op settings are columns 3-5)."""
+    settings = np.round(rows[:, 2:5], 1)
+    _, inv = np.unique(settings, axis=0, return_inverse=True)
+    return np.asarray(inv).ravel()
+
+
 @dataclass
 class Preprocessor:
+    """Min-max scaler over a fixed set of feature columns (fit on training data only)."""
     keep: np.ndarray | None = None
     low: np.ndarray | None = None
     high: np.ndarray | None = None
 
-    def fit(self, engines):
-        matrix = np.vstack([rows[:, 2:] for rows in engines.values()])
+    def fit_matrix(self, matrix):
         std = matrix.std(axis=0)
         self.keep = np.where(std > 1e-8)[0]
         if len(self.keep) == 0:
             raise ValueError("All input features are constant")
-        matrix = matrix[:, self.keep]
-        self.low = matrix.min(axis=0)
-        self.high = matrix.max(axis=0)
+        m = matrix[:, self.keep]
+        self.low, self.high = m.min(axis=0), m.max(axis=0)
         return self
 
     @property
     def n_features(self):
         return len(self.keep)
 
-    def transform(self, rows):
-        x = rows[:, 2:][:, self.keep]
+    def scale(self, x):
         span = np.maximum(self.high - self.low, 1e-12)
-        return (x - self.low) / span  # test values outside training range are not clipped
+        return (x - self.low) / span
+
+
+@dataclass
+class RegimePreprocessor:
+    """Global min-max bounds plus one set of bounds per operating regime.
+    All regimes share the global keep set, so the feature width is identical."""
+    per_regime: dict = field(default_factory=dict)
+    global_pre: Preprocessor | None = None
+
+    def fit(self, engines):
+        matrix = np.vstack([rows[:, 2:] for rows in engines.values()])
+        self.global_pre = Preprocessor().fit_matrix(matrix)
+        keep = self.global_pre.keep
+        grouped = {}
+        for rows in engines.values():
+            ids = regime_ids(rows)
+            for r in np.unique(ids):
+                grouped.setdefault(int(r), []).append(rows[ids == r][:, 2:][:, keep])
+        self.per_regime = {}
+        for r, chunks in grouped.items():
+            mat = np.vstack(chunks)
+            if len(mat) >= 10:
+                self.per_regime[r] = Preprocessor(keep=keep, low=mat.min(axis=0),
+                                                  high=mat.max(axis=0))
+        return self
+
+    @property
+    def n_features(self):
+        return self.global_pre.n_features
+
+    def transform(self, rows):
+        out = np.empty((len(rows), self.n_features))
+        ids = regime_ids(rows)
+        for r in np.unique(ids):
+            m = ids == r
+            pre = self.per_regime.get(int(r), self.global_pre)
+            out[m] = pre.scale(rows[m][:, 2:][:, self.global_pre.keep])
+        return out
 
     def to_dict(self):
-        return {"keep": self.keep.tolist(), "low": self.low.tolist(),
-                "high": self.high.tolist()}
+        def plain(p):
+            return {"keep": p.keep.tolist(), "low": p.low.tolist(), "high": p.high.tolist()}
+        return {"global": plain(self.global_pre),
+                "per_regime": {str(k): plain(v) for k, v in self.per_regime.items()}}
+
+    @staticmethod
+    def from_dict(d):
+        def mk(v):
+            return Preprocessor(keep=np.asarray(v["keep"], dtype=int),
+                                low=np.asarray(v["low"], dtype=float),
+                                high=np.asarray(v["high"], dtype=float))
+        rp = RegimePreprocessor()
+        rp.global_pre = mk(d["global"])
+        rp.per_regime = {int(k): mk(v) for k, v in d["per_regime"].items()}
+        return rp
 
 
-# ------------------------- R-CSNF-STYLE RESERVOIR -----------------
+# ------------------------- R-CSNF RESERVOIR -----------------------
 
 class CSNFReservoir:
-    """Deterministic recurrent complex-valued reservoir inspired by
-    split-step Schrödinger field dynamics."""
+    """Recurrent complex-valued wave-field reservoir (R-CSNF v3 structure)."""
 
-    def __init__(self, input_dim, grid_n=32, num_lags=3, pool_bins=8,
-                 evolve_steps=5, alpha_inject=0.6, packet_width=0.35,
-                 diffusion=0.01, potential=0.4):
+    def __init__(self, input_dim, alpha_inject=0.6, packet_width=0.35,
+                 diffusion=0.01, grid_n=GRID_N, num_lags=NUM_LAGS,
+                 pool_bins=POOL_BINS, evolve_steps=EVOLVE_STEPS, potential=POTENTIAL):
         if input_dim < 1:
             raise ValueError("input_dim must be positive")
         if grid_n % pool_bins:
@@ -209,10 +268,10 @@ class CSNFReservoir:
         self.evolve_steps = evolve_steps
         self.alpha = alpha_inject
         self.packet_width = packet_width
+        self.coupling_amplitude = np.log(2.0)
         self.length = 2 * np.pi
         self.x = np.linspace(0, self.length, grid_n, endpoint=False)
-        dx = self.length / grid_n
-        self.k = 2 * np.pi * np.fft.fftfreq(grid_n, d=dx)
+        self.k = 2 * np.pi * np.fft.fftfreq(grid_n, d=self.length / grid_n)
         dt = 1.0 / evolve_steps
         self.propagator = np.exp(-0.5j * diffusion * self.k ** 2 * dt)
         self.vpsi = np.exp(-1j * potential * np.cos(2 * self.x) * dt)
@@ -220,10 +279,11 @@ class CSNFReservoir:
 
     @property
     def n_features_out(self):
-        return 7 * self.pool_bins + self.num_lags * self.input_dim
+        # 7P - 1 pooled field features + num_lags * input_dim raw lag inputs
+        return 7 * self.pool_bins - 1 + self.num_lags * self.input_dim
 
-    def kinetic(self, field):
-        return np.fft.ifft(np.fft.fft(field) * self.propagator)
+    def kinetic(self, f):
+        return np.fft.ifft(np.fft.fft(f) * self.propagator)
 
     @staticmethod
     def normalize(psi, phi):
@@ -235,17 +295,12 @@ class CSNFReservoir:
         return psi / norm, phi / norm
 
     def encode(self, lags):
-        lags = np.asarray(lags, dtype=float)
-        if lags.shape != (self.num_lags, self.input_dim):
-            raise ValueError(f"Unexpected lag shape: {lags.shape}")
         arc = self.length / self.input_dim
         width = max(1e-8, min(self.packet_width, arc * 0.5))
         weights = np.exp(-0.35 * np.arange(self.num_lags))
         weights /= weights.sum()
-        if self.num_lags > 1:
-            velocity = np.angle(np.exp(1j * (lags[0] - lags[1])))
-        else:
-            velocity = np.zeros(self.input_dim)
+        velocity = (np.angle(np.exp(1j * (lags[0] - lags[1])))
+                    if self.num_lags > 1 else np.zeros(self.input_dim))
         signal = 0.5 * (1 + np.tanh(lags))
         phi = np.zeros(self.n, dtype=complex)
         for lag in range(self.num_lags):
@@ -262,7 +317,7 @@ class CSNFReservoir:
         for step in range(self.evolve_steps):
             psi = self.kinetic(psi)
             phi = self.kinetic(phi)
-            coupling = 0.1 * np.exp(-1j * (step + 0.5))
+            coupling = self.coupling_amplitude * np.exp(-1j * (step + 0.5))
             psi_old = psi.copy()
             psi = psi * self.vpsi - 1j * coupling * phi
             phi = phi * self.vphi - 1j * np.conj(coupling) * psi_old
@@ -283,17 +338,15 @@ class CSNFReservoir:
         return np.concatenate([psi, phi])
 
     def features(self, state, lags):
-        psi = state[:self.n]
-        phi = state[self.n:]
+        psi, phi = state[:self.n], state[self.n:]
 
-        def pool(values):
-            return values.reshape(self.pool_bins, -1).mean(axis=1)
+        def pool(v):
+            return v.reshape(self.pool_bins, -1).mean(axis=1)
 
         derivative = np.fft.ifft(1j * self.k * np.fft.fft(psi))
         values = np.concatenate([
-            pool(np.abs(psi) ** 2), pool(np.abs(phi) ** 2),
-            pool(psi.real), pool(psi.imag),
-            pool(phi.real), pool(phi.imag),
+            pool(np.abs(psi) ** 2), pool(np.abs(phi) ** 2)[:-1],
+            pool(psi.real), pool(psi.imag), pool(phi.real), pool(phi.imag),
             pool(np.imag(np.conj(psi) * derivative)),
             lags.reshape(-1),
         ])
@@ -312,26 +365,42 @@ class CSNFReservoir:
         return output
 
 
-# ------------------------- RIDGE / METRICS ------------------------
+# ------------------------- READOUT / METRICS ----------------------
 
-def fit_ridge(X, y, regularization=1.0):
+def fit_ridge(X, y, regularization=1e-4, rcond=1e-4, w=None):
+    """SVD ridge readout on standardized features, with optional row weights."""
     X = np.asarray(X, dtype=float)
     y = np.asarray(y, dtype=float)
-    mean = X.mean(axis=0)
-    scale = X.std(axis=0)
+    w = np.ones(len(y)) if w is None else np.asarray(w, dtype=float)
+    wsum = w.sum()
+    mean = (X * w[:, None]).sum(0) / wsum
+    scale = np.sqrt(((X - mean) ** 2 * w[:, None]).sum(0) / wsum)
     scale[scale < 1e-8] = 1.0
-    Z = (X - mean) / scale
-    y_mean = y.mean()
+    y_mean = float((y * w).sum() / wsum)
+    sw = np.sqrt(w)[:, None]
+    Z = (X - mean) / scale * sw
+    yw = (y - y_mean) * sw[:, 0]
     U, S, Vt = np.linalg.svd(Z, full_matrices=False)
     factors = S / (S ** 2 + regularization)
     if len(S):
-        factors[S <= S[0] * 1e-10] = 0.0
-    weights = Vt.T @ (factors * (U.T @ (y - y_mean)))
-    return {"mean": mean, "scale": scale, "weights": weights, "y_mean": float(y_mean)}
+        factors[S <= S[0] * rcond] = 0.0
+    weights = Vt.T @ (factors * (U.T @ yw))
+    return {"mean": mean, "scale": scale, "weights": weights, "y_mean": y_mean}
 
 
 def predict_ridge(model, X):
     return ((X - model["mean"]) / model["scale"]) @ model["weights"] + model["y_mean"]
+
+
+def rul_balance_weights(y, bins=RUL_BINS):
+    """Equal total weight per RUL band, so the healthy plateau does not dominate.
+    Set BALANCE_RUL = False to train with uniform weights (ablation)."""
+    if not BALANCE_RUL:
+        return np.ones(len(y))
+    idx = np.clip(np.digitize(y, bins[1:-1]), 0, len(bins) - 2)
+    counts = np.bincount(idx, minlength=len(bins) - 1).astype(float)
+    counts[counts == 0] = 1.0
+    return (len(y) / (len(bins) - 1)) / counts[idx]
 
 
 def rmse(y_true, y_pred):
@@ -343,10 +412,8 @@ def mae(y_true, y_pred):
 
 
 def phm_score(prediction, truth):
-    delta = np.asarray(prediction) - np.asarray(truth)
-    return float(np.sum(np.where(delta < 0,
-                                 np.exp(-delta / 13.0) - 1,
-                                 np.exp(delta / 10.0) - 1)))
+    d = np.asarray(prediction) - np.asarray(truth)
+    return float(np.sum(np.where(d < 0, np.exp(-d / 13.0) - 1, np.exp(d / 10.0) - 1)))
 
 
 def causal_mean_features(X, window=5):
@@ -354,6 +421,48 @@ def causal_mean_features(X, window=5):
     for t in range(len(X)):
         result[t] = X[max(0, t - window + 1):t + 1].mean(axis=0)
     return np.hstack([X, result])
+
+
+# ------------------------- POST-PROCESSING ------------------------
+
+def causal_ema_deadband(pred, beta, deadband):
+    """Causal smoothing. RUL falls by one per cycle; large jumps are damped."""
+    out = np.empty_like(pred, dtype=float)
+    out[0] = pred[0]
+    for t in range(1, len(pred)):
+        expected = out[t - 1] - 1.0
+        target = pred[t]
+        out[t] = expected if abs(target - expected) < deadband \
+            else expected + beta * (target - expected)
+    return out
+
+
+def postprocess(pred, beta, deadband, washout=WASHOUT):
+    p = np.asarray(pred, dtype=float).copy()
+    if len(p) > washout:
+        p[:washout] = p[washout]          # hold the first settled value
+    p = causal_ema_deadband(p, beta, deadband)
+    return np.clip(p, 0, R_MAX)
+
+
+# ------------------------- ERROR PROFILE --------------------------
+
+def error_profile(y_true, y_pred, cycles):
+    err = np.asarray(y_pred, float) - np.asarray(y_true, float)
+    rows = []
+    for lo, hi in zip(RUL_BINS[:-1], RUL_BINS[1:]):
+        m = (y_true >= lo) & (y_true < hi)
+        if m.any():
+            rows.append({"rul_band": f"[{lo},{hi})", "n": int(m.sum()),
+                         "rmse": float(np.sqrt(np.mean(err[m] ** 2))),
+                         "bias": float(np.mean(err[m]))})
+    for lo, hi in zip(CYCLE_BINS[:-1], CYCLE_BINS[1:]):
+        m = (cycles >= lo) & (cycles < hi)
+        if m.any():
+            rows.append({"cycle_band": f"[{lo},{hi})", "n": int(m.sum()),
+                         "rmse": float(np.sqrt(np.mean(err[m] ** 2))),
+                         "bias": float(np.mean(err[m]))})
+    return rows
 
 
 # ------------------------- TRIAGE ---------------------------------
@@ -385,7 +494,6 @@ def idempotency_key(subset, engine_id, cycle, action):
 
 
 def build_triage_rows(subset, engines_out):
-    """Return (work_orders, exceptions) as lists of dicts. Deterministic."""
     work, exc = [], []
     for e in engines_out:
         for t, rul in enumerate(e["history"], start=1):
@@ -403,7 +511,15 @@ def build_triage_rows(subset, engines_out):
     return work, exc
 
 
-# ------------------------- MODEL PERSISTENCE ----------------------
+# ------------------------- PERSISTENCE ----------------------------
+
+def model_to_plain(m):
+    return {k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in m.items()}
+
+
+def plain_to_model(d):
+    return {k: (np.asarray(v) if isinstance(v, list) else v) for k, v in d.items()}
+
 
 @dataclass
 class Artifact:
@@ -433,17 +549,68 @@ def make_model_version(subset, seed, train_hash, best):
     return hashlib.sha256(raw.encode()).hexdigest()[:12]
 
 
+# ------------------------- TUNING ---------------------------------
+
+def make_items(engines, pre):
+    return [(pre.transform(engines[i]), rul_targets(len(engines[i])), engines[i])
+            for i in sorted(engines)]
+
+
+def sample_trials(n_trials, seed):
+    """Random search over the paper's R-CSNF spaces (equal budget per trial)."""
+    rng = np.random.default_rng(seed)
+    trials = []
+    for _ in range(n_trials):
+        trials.append({
+            "alpha": float(rng.uniform(*SEARCH_ALPHA)),
+            "diffusion": float(10 ** rng.uniform(*np.log10(SEARCH_DIFFUSION))),
+            "width": float(rng.uniform(*SEARCH_WIDTH)),
+            "lambda": float(10 ** rng.uniform(*np.log10(SEARCH_LAMBDA))),
+        })
+    return trials
+
+
+def evaluate_trial(trial, pre, fit_items, val_items):
+    """Fit the readout on fit_items, score RUL RMSE over validation cycles after washout."""
+    res = CSNFReservoir(input_dim=pre.n_features, alpha_inject=trial["alpha"],
+                        packet_width=trial["width"], diffusion=trial["diffusion"])
+    X_fit = np.vstack([res.run_engine(X)[WASHOUT:] for X, _, _ in fit_items])
+    y_fit = np.concatenate([y[WASHOUT:] for _, y, _ in fit_items])
+    model = fit_ridge(X_fit, y_fit, trial["lambda"], w=rul_balance_weights(y_fit))
+    preds, truths = [], []
+    for X, y, _ in val_items:
+        p = np.clip(predict_ridge(model, res.run_engine(X)), 0, R_MAX)
+        preds.append(p[WASHOUT:])
+        truths.append(y[WASHOUT:])
+    return rmse(np.concatenate(truths), np.concatenate(preds))
+
+
+def best_smoothing(model, res, val_items):
+    cache = [(res.run_engine(X), y) for X, y, _ in val_items]
+    best = None
+    for beta in SMOOTH_BETA_GRID:
+        for db in SMOOTH_DEADBAND_GRID:
+            preds, truths = [], []
+            for F, y in cache:
+                p = postprocess(predict_ridge(model, F), beta, db)
+                preds.append(p[WASHOUT:])
+                truths.append(y[WASHOUT:])
+            score = rmse(np.concatenate(truths), np.concatenate(preds))
+            if best is None or score < best["score"]:
+                best = {"score": score, "beta": beta, "deadband": db}
+    return best
+
+
 # ------------------------- MAIN PIPELINE --------------------------
 
-def run_pipeline(subset="FD001", data_dir=None, out_dir=None, seed=SEED):
-    # Honour container/runtime configuration even when callers omit explicit paths.
+def run_pipeline(subset="FD001", data_dir=None, out_dir=None, seed=SEED,
+                 trials=DEFAULT_TRIALS):
     data_dir = data_dir or os.environ.get("AERO_DATA_DIR", "data")
     out_dir = out_dir or os.environ.get("AERO_OUT_DIR", "runs")
     if subset not in SUBSETS:
         raise ValueError(f"Unsupported subset: {subset}")
     run_dir = os.path.join(out_dir, subset)
     os.makedirs(run_dir, exist_ok=True)
-
     paths = locate_dataset(subset, data_dir)
 
     log("[1] Loading and validating data")
@@ -457,154 +624,126 @@ def run_pipeline(subset="FD001", data_dir=None, out_dir=None, seed=SEED):
         raise ValueError(f"RUL rows ({len(test_rul)}) != test engines ({len(test_ids)})")
     log(f"Training engines: {len(train_engines)} | test engines: {len(test_ids)}")
 
-    checkpoint_path = os.path.join(run_dir, "training_checkpoint.pkl")
-
-    def atomic_pickle_save(payload, path):
-        """Write checkpoint atomically so an interrupted write cannot corrupt it."""
-        temp_path = path + ".tmp"
-        with open(temp_path, "wb") as handle:
-            pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp_path, path)
-
+    checkpoint_path = os.path.join(run_dir, f"training_checkpoint_seed{seed}.pkl")
     checkpoint = None
     if os.path.isfile(checkpoint_path):
         try:
-            with open(checkpoint_path, "rb") as handle:
-                candidate = pickle.load(handle)
-            expected = {
-                "pipeline_version": __version__,
-                "subset": subset,
-                "seed": seed,
-                "train_sha256": train_hash,
-                "test_sha256": test_hash,
-            }
-            if all(candidate.get(k) == v for k, v in expected.items()):
-                checkpoint = candidate
-                log(f"[RESUME] Compatible training checkpoint found: {checkpoint_path}")
+            with open(checkpoint_path, "rb") as h:
+                cand = pickle.load(h)
+            expected = {"pipeline_version": __version__, "subset": subset, "seed": seed,
+                        "train_sha256": train_hash, "test_sha256": test_hash,
+                        "trials": trials}
+            if all(cand.get(k) == v for k, v in expected.items()):
+                checkpoint = cand
+                log(f"[RESUME] Compatible checkpoint: {checkpoint_path}")
             else:
-                log("[RESUME] Checkpoint does not match this dataset/configuration; retraining.")
+                log("[RESUME] Checkpoint does not match configuration; retraining.")
         except Exception as exc:
-            log(f"[RESUME] Checkpoint could not be read ({exc}); retraining.")
+            log(f"[RESUME] Checkpoint unreadable ({exc}); retraining.")
 
     if checkpoint is not None:
         best = checkpoint["best"]
-        pre_dict = checkpoint["preprocessor"]
-        pre = Preprocessor(
-            keep=np.asarray(pre_dict["keep"], dtype=int),
-            low=np.asarray(pre_dict["low"], dtype=float),
-            high=np.asarray(pre_dict["high"], dtype=float),
-        )
-        cfg = checkpoint["reservoir_config"]
-        reservoir = CSNFReservoir(
-            input_dim=cfg["input_dim"],
-            alpha_inject=cfg["alpha_inject"],
-            packet_width=cfg["packet_width"],
-        )
+        smooth = checkpoint["smoothing"]
+        profile = checkpoint.get("validation_error_profile", [])
+        search_log = checkpoint.get("search_log", [])
+        pre = RegimePreprocessor.from_dict(checkpoint["preprocessor"])
         model = plain_to_model(checkpoint["reservoir_model"])
         baseline = plain_to_model(checkpoint["baseline_model"])
-        log("[RESUME] Skipped validation tuning and final training; continuing at test evaluation.")
+        reservoir = CSNFReservoir(input_dim=pre.n_features, alpha_inject=best["alpha"],
+                                  packet_width=best["width"], diffusion=best["diffusion"])
     else:
         log("[2] Engine-level validation split")
         fit_ids, val_ids = split_engine_ids(train_engines.keys(), seed=seed)
         fit_engines = {i: train_engines[i] for i in fit_ids}
         val_engines = {i: train_engines[i] for i in val_ids}
 
-        log("[3] Validation tuning")
-        pre_val = Preprocessor().fit(fit_engines)
-
-        def make_items(engines, pp):
-            return [(pp.transform(engines[i]), rul_targets(len(engines[i])))
-                    for i in sorted(engines)]
-
+        log(f"[3] Random search over paper's R-CSNF space ({trials} trials)")
+        pre_val = RegimePreprocessor().fit(fit_engines)
         fit_items = make_items(fit_engines, pre_val)
         val_items = make_items(val_engines, pre_val)
-
-        best = None
-        for alpha in GRID_SEARCH_ALPHA:
-            for width in GRID_SEARCH_WIDTH:
-                res = CSNFReservoir(input_dim=pre_val.n_features,
-                                    alpha_inject=alpha, packet_width=width)
-                X_fit = np.vstack([res.run_engine(X)[WASHOUT:] for X, _ in fit_items])
-                y_fit = np.concatenate([y[WASHOUT:] for _, y in fit_items])
-                X_val = np.vstack([res.run_engine(X)[WASHOUT:] for X, _ in val_items])
-                y_val = np.concatenate([y[WASHOUT:] for _, y in val_items])
-                for lam in GRID_SEARCH_LAMBDA:
-                    candidate_model = fit_ridge(X_fit, y_fit, lam)
-                    pred = np.clip(predict_ridge(candidate_model, X_val), 0, R_MAX)
-                    score = rmse(y_val, pred)
-                    log(f"  alpha={alpha} width={width} lambda={lam}: val RMSE={score:.3f}")
-                    if best is None or score < best["score"]:
-                        best = {"score": score, "alpha": alpha, "width": width, "lambda": lam}
+        search_log, best = [], None
+        for i, trial in enumerate(sample_trials(trials, seed)):
+            score = evaluate_trial(trial, pre_val, fit_items, val_items)
+            search_log.append({**trial, "val_rmse": score})
+            log(f"  trial {i + 1:2d}: alpha={trial['alpha']:.3f} D={trial['diffusion']:.4g} "
+                f"width={trial['width']:.3f} lambda={trial['lambda']:.2e} -> val RMSE={score:.3f}")
+            if best is None or score < best["score"]:
+                best = {**trial, "score": score}
         log(f"Best reservoir settings: {best}")
 
-        log("[4] Final training on all training engines")
-        pre = Preprocessor().fit(train_engines)
+        log("[3b] Causal smoothing and validation error profile")
+        res_val = CSNFReservoir(input_dim=pre_val.n_features, alpha_inject=best["alpha"],
+                                packet_width=best["width"], diffusion=best["diffusion"])
+        X_fit = np.vstack([res_val.run_engine(X)[WASHOUT:] for X, _, _ in fit_items])
+        y_fit = np.concatenate([y[WASHOUT:] for _, y, _ in fit_items])
+        cand_model = fit_ridge(X_fit, y_fit, best["lambda"], w=rul_balance_weights(y_fit))
+        smooth = best_smoothing(cand_model, res_val, val_items)
+        log(f"Best smoothing: {smooth}")
+        vp_t, vp_p, vp_c = [], [], []
+        for X, y, _ in val_items:
+            p = postprocess(predict_ridge(cand_model, res_val.run_engine(X)),
+                            smooth["beta"], smooth["deadband"])
+            vp_t.append(y)
+            vp_p.append(p)
+            vp_c.append(np.arange(1, len(y) + 1))
+        profile = error_profile(np.concatenate(vp_t), np.concatenate(vp_p),
+                                np.concatenate(vp_c))
+
+        log("[4] Final training on all training engines (selected settings)")
+        pre = RegimePreprocessor().fit(train_engines)
         train_items = make_items(train_engines, pre)
-        reservoir = CSNFReservoir(input_dim=pre.n_features,
-                                  alpha_inject=best["alpha"], packet_width=best["width"])
-        X_train = np.vstack([reservoir.run_engine(X)[WASHOUT:] for X, _ in train_items])
-        y_train = np.concatenate([y[WASHOUT:] for _, y in train_items])
-        model = fit_ridge(X_train, y_train, best["lambda"])
+        reservoir = CSNFReservoir(input_dim=pre.n_features, alpha_inject=best["alpha"],
+                                  packet_width=best["width"], diffusion=best["diffusion"])
+        X_train = np.vstack([reservoir.run_engine(X)[WASHOUT:] for X, _, _ in train_items])
+        y_train = np.concatenate([y[WASHOUT:] for _, y, _ in train_items])
+        w_train = rul_balance_weights(y_train)
+        model = fit_ridge(X_train, y_train, best["lambda"], w=w_train)
+        B_train = np.vstack([causal_mean_features(X)[WASHOUT:] for X, _, _ in train_items])
+        baseline = fit_ridge(B_train, y_train, best["lambda"], w=w_train)
 
-        B_train = np.vstack([causal_mean_features(X)[WASHOUT:] for X, _ in train_items])
-        baseline = fit_ridge(B_train, y_train, best["lambda"])
+        payload = {"pipeline_version": __version__, "subset": subset, "seed": seed,
+                   "train_sha256": train_hash, "test_sha256": test_hash,
+                   "trials": trials, "best": best, "smoothing": smooth,
+                   "search_log": search_log,
+                   "validation_error_profile": profile,
+                   "preprocessor": pre.to_dict(),
+                   "reservoir_model": model_to_plain(model),
+                   "baseline_model": model_to_plain(baseline)}
+        tmp = checkpoint_path + ".tmp"
+        with open(tmp, "wb") as h:
+            pickle.dump(payload, h, protocol=pickle.HIGHEST_PROTOCOL)
+            h.flush()
+            os.fsync(h.fileno())
+        os.replace(tmp, checkpoint_path)
+        log(f"[CHECKPOINT] Saved: {checkpoint_path}")
 
-        # Save the expensive training result before the test-evaluation stage.
-        # The checkpoint is reusable only for the same dataset hashes and settings.
-        checkpoint_payload = {
-            "pipeline_version": __version__,
-            "subset": subset,
-            "seed": seed,
-            "train_sha256": train_hash,
-            "test_sha256": test_hash,
-            "best": best,
-            "preprocessor": pre.to_dict(),
-            "reservoir_config": {
-                "alpha_inject": best["alpha"],
-                "packet_width": best["width"],
-                "input_dim": pre.n_features,
-            },
-            "reservoir_model": model_to_plain(model),
-            "baseline_model": model_to_plain(baseline),
-        }
-        atomic_pickle_save(checkpoint_payload, checkpoint_path)
-        log(f"[CHECKPOINT] Training checkpoint saved: {checkpoint_path}")
-
-    log("[5] Test evaluation (same protocol for both models: last cycle of each test engine)")
+    log("[5] Test evaluation (last cycle of each test engine, official RUL labels)")
     truth_capped = np.minimum(test_rul, R_MAX)
     engines_out, res_last, base_last = [], [], []
     for i, engine_id in enumerate(test_ids):
         rows = test_engines[engine_id]
         X = pre.transform(rows)
-        res_pred = np.clip(predict_ridge(model, reservoir.run_engine(X)), 0, R_MAX)
+        raw = predict_ridge(model, reservoir.run_engine(X))
+        res_pred = postprocess(raw, smooth["beta"], smooth["deadband"])
         base_pred = np.clip(predict_ridge(baseline, causal_mean_features(X)), 0, R_MAX)
         res_last.append(res_pred[-1])
         base_last.append(base_pred[-1])
         sev = severity_band(float(res_pred[-1]))
         engines_out.append({
-            "id": int(engine_id),
-            "cycles_observed": int(len(rows)),
-            "pred_rul": round(float(res_pred[-1]), 2),
-            "true_rul": float(test_rul[i]),
-            "severity": sev,
-            "action": triage_action(sev),
+            "id": int(engine_id), "cycles_observed": int(len(rows)),
+            "pred_rul": round(float(res_pred[-1]), 2), "true_rul": float(test_rul[i]),
+            "severity": sev, "action": triage_action(sev),
             "history": [round(float(v), 2) for v in res_pred],
             "sensors": {f"s{k}": float(rows[-1][4 + k]) for k in range(1, 22)},
         })
+    res_last, base_last = np.asarray(res_last), np.asarray(base_last)
 
-    res_last = np.asarray(res_last)
-    base_last = np.asarray(base_last)
     metrics = {
-        "subset": subset,
-        "pipeline_version": __version__,
-        "seed": seed,
+        "subset": subset, "pipeline_version": __version__, "seed": seed,
         "generated_at": store.now_iso(),
-        "train_sha256": train_hash,
-        "test_sha256": test_hash,
-        "test_engines": len(test_ids),
-        "best_parameters": best,
+        "train_sha256": train_hash, "test_sha256": test_hash,
+        "test_engines": len(test_ids), "trials": trials,
+        "best_parameters": best, "smoothing": smooth,
         "reservoir": {
             "rmse_capped": rmse(truth_capped, res_last),
             "mae_capped": mae(truth_capped, res_last),
@@ -617,19 +756,22 @@ def run_pipeline(subset="FD001", data_dir=None, out_dir=None, seed=SEED):
             "rmse_uncapped": rmse(test_rul, base_last),
             "phm_score_uncapped": phm_score(base_last, test_rul),
         },
+        "validation_error_profile": profile,
     }
     model_version = make_model_version(subset, seed, train_hash, best)
     metrics["model_version"] = model_version
     for name in ("reservoir", "ridge_baseline"):
         log(f"{name}: " + ", ".join(f"{k}={v:.4f}" for k, v in metrics[name].items()))
+    for row in profile:
+        log("  profile: " + json.dumps(row))
 
     log("[6] Persisting artifact, predictions, work orders and audit log")
     Artifact(
         model_version=model_version, subset=subset, seed=seed,
-        best_parameters=best, preprocessor=pre.to_dict(),
-        reservoir_config={"alpha_inject": best["alpha"],
-                          "packet_width": best["width"],
-                          "input_dim": pre.n_features},
+        best_parameters={**best, "smoothing": smooth},
+        preprocessor=pre.to_dict(),
+        reservoir_config={"alpha_inject": best["alpha"], "packet_width": best["width"],
+                          "diffusion": best["diffusion"], "input_dim": pre.n_features},
         reservoir_model=model_to_plain(model),
         baseline_model=model_to_plain(baseline),
         train_sha256=train_hash, test_sha256=test_hash,
@@ -644,12 +786,11 @@ def run_pipeline(subset="FD001", data_dir=None, out_dir=None, seed=SEED):
     con = store.connect(os.path.join(run_dir, "maintenance.sqlite"))
     try:
         with con:
-            store.write_run(con, {
-                "run_id": model_version, "subset": subset,
-                "model_version": model_version, "seed": seed,
-                "train_sha256": train_hash, "test_sha256": test_hash,
-                "created_at": created_at, "metrics_json": json.dumps(metrics),
-            })
+            store.write_run(con, {"run_id": model_version, "subset": subset,
+                                  "model_version": model_version, "seed": seed,
+                                  "train_sha256": train_hash, "test_sha256": test_hash,
+                                  "created_at": created_at,
+                                  "metrics_json": json.dumps(metrics)})
             store.write_predictions(con, model_version, engines_out)
             new_wo = store.write_work_orders(con, model_version, subset, work, created_at)
             new_exc = store.write_exceptions(con, model_version, subset, exc, created_at)
@@ -658,16 +799,15 @@ def run_pipeline(subset="FD001", data_dir=None, out_dir=None, seed=SEED):
     finally:
         con.close()
 
-    metrics["work_orders_new"] = new_wo
-    metrics["work_orders_total"] = total_wo
-    metrics["exceptions_new"] = new_exc
-    metrics["exceptions_total"] = total_exc
-
+    metrics.update({"work_orders_new": new_wo, "work_orders_total": total_wo,
+                    "exceptions_new": new_exc, "exceptions_total": total_exc})
     with open(os.path.join(run_dir, "predictions.json"), "w", encoding="utf-8") as f:
         json.dump({"subset": subset, "model_version": model_version,
                    "engines": engines_out}, f)
     with open(os.path.join(run_dir, "metrics.json"), "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
+    with open(os.path.join(run_dir, "search_log.json"), "w", encoding="utf-8") as f:
+        json.dump(search_log, f, indent=2)
 
     log(f"Work orders: {new_wo} new / {total_wo} total | "
         f"exceptions: {new_exc} new / {total_exc} total")
@@ -675,26 +815,16 @@ def run_pipeline(subset="FD001", data_dir=None, out_dir=None, seed=SEED):
     return metrics
 
 
-def model_to_plain(m):
-    return {k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in m.items()}
-
-
-def plain_to_model(d):
-    return {k: (np.asarray(v) if isinstance(v, list) else v) for k, v in d.items()}
-
-
 def predict_with_artifact(artifact, rows):
     """Reproduce predictions for one engine's raw rows from a saved artifact."""
-    pre = Preprocessor(keep=np.asarray(artifact.preprocessor["keep"]),
-                       low=np.asarray(artifact.preprocessor["low"]),
-                       high=np.asarray(artifact.preprocessor["high"]))
+    pre = RegimePreprocessor.from_dict(artifact.preprocessor)
     cfg = artifact.reservoir_config
-    res = CSNFReservoir(input_dim=cfg["input_dim"],
-                        alpha_inject=cfg["alpha_inject"],
-                        packet_width=cfg["packet_width"])
-    X = pre.transform(rows)
-    return np.clip(predict_ridge(plain_to_model(artifact.reservoir_model),
-                                 res.run_engine(X)), 0, R_MAX)
+    res = CSNFReservoir(input_dim=cfg["input_dim"], alpha_inject=cfg["alpha_inject"],
+                        packet_width=cfg["packet_width"], diffusion=cfg["diffusion"])
+    raw = predict_ridge(plain_to_model(artifact.reservoir_model),
+                        res.run_engine(pre.transform(rows)))
+    smooth = artifact.best_parameters["smoothing"]
+    return postprocess(raw, smooth["beta"], smooth["deadband"])
 
 
 # ------------------------- SELF-TEST ------------------------------
@@ -704,16 +834,15 @@ def run_selftest():
     rng = np.random.default_rng(123)
     X = rng.normal(size=(30, 4))
     y = np.linspace(30, 0, 30)
-    res = CSNFReservoir(input_dim=4, grid_n=32, pool_bins=8)
+    res = CSNFReservoir(input_dim=4)
     F = res.run_engine(X)
     assert F.shape == (30, res.n_features_out) and np.isfinite(F).all()
-    pred = predict_ridge(fit_ridge(F, y, 1.0), F)
+    pred = predict_ridge(fit_ridge(F, y, 1e-4, w=rul_balance_weights(y)), F)
     assert pred.shape == y.shape and np.isfinite(pred).all()
-    assert severity_band(5) == "critical"
-    assert severity_band(20) == "high"
-    assert severity_band(45) == "medium"
-    assert severity_band(100) == "low"
+    assert severity_band(5) == "critical" and severity_band(20) == "high"
+    assert severity_band(45) == "medium" and severity_band(100) == "low"
     assert severity_band(float("nan")) == "review"
+    assert len(sample_trials(4, 0)) == 4
     print("Self-test passed.")
 
 
@@ -723,9 +852,10 @@ if __name__ == "__main__":
     parser.add_argument("--data-dir", default=os.environ.get("AERO_DATA_DIR", "data"))
     parser.add_argument("--out-dir", default=os.environ.get("AERO_OUT_DIR", "runs"))
     parser.add_argument("--seed", type=int, default=SEED)
+    parser.add_argument("--trials", type=int, default=DEFAULT_TRIALS)
     parser.add_argument("--selftest", action="store_true")
     args = parser.parse_args()
     if args.selftest:
         run_selftest()
     else:
-        run_pipeline(args.subset, args.data_dir, args.out_dir, args.seed)
+        run_pipeline(args.subset, args.data_dir, args.out_dir, args.seed, args.trials)
